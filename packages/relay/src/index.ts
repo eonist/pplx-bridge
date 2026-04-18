@@ -18,8 +18,8 @@ app.get('/live', (_req, res) => {
 });
 
 // ── Asset proxy ───────────────────────────────────────────────────────────────
-// Forwards requests to the original origin so cross-origin resources
-// (images, fonts, CSS) resolve correctly inside the viewer iframe.
+// Forwards requests to original origin so cross-origin resources resolve
+// inside the viewer iframe without CSP / CORS errors.
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -35,8 +35,10 @@ app.get('/assets/*', async (req, res) => {
     });
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('content-type', ct);
+    // Strip security headers that would block the viewer from rendering assets
     res.removeHeader('content-security-policy');
     res.removeHeader('x-frame-options');
+    res.removeHeader('cross-origin-resource-policy');
     const buf = await upstream.arrayBuffer();
     res.send(Buffer.from(buf));
   } catch (err) {
@@ -45,16 +47,19 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
+// ── Health check (useful for CI / prereq script) ──────────────────────────────
+app.get('/health', (_req, res) => res.json({ ok: true, port: PORT }));
+
 // ── WebSocket channels ────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
-const recorders = new Set<WebSocket>(); // Chrome extension connections
-const viewers   = new Set<WebSocket>(); // Comet viewer tab connections
+const recorders = new Set<WebSocket>(); // Chrome extension ingest
+const viewers   = new Set<WebSocket>(); // Comet viewer tabs
 
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
-  // 1. /ingest — recorder → relay: rrweb event stream
+  // 1. /ingest — recorder → relay: rrweb event stream in
   if (url === '/ingest') {
     recorders.add(ws);
     console.log(`[relay] ▲ recorder connected   (total: ${recorders.size})`);
@@ -91,13 +96,15 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n╔${'═'.repeat(44)}╗`);
-  console.log(`║  pplx-bridge relay  →  localhost:${PORT}${' '.repeat(44 - 28 - String(PORT).length)}║`);
-  console.log(`╚${'═'.repeat(44)}╝`);
+  const w = 44;
+  console.log(`\n╔${'═'.repeat(w)}╗`);
+  console.log(`║  pplx-bridge relay  →  localhost:${PORT}${' '.repeat(w - 28 - String(PORT).length)}║`);
+  console.log(`╚${'═'.repeat(w)}╝`);
   console.log(`  Ingest      ws://localhost:${PORT}/ingest`);
   console.log(`  Subscribe   ws://localhost:${PORT}/subscribe`);
   console.log(`  Actions     ws://localhost:${PORT}/actions`);
-  console.log(`  Viewer      http://localhost:${PORT}/live\n`);
+  console.log(`  Viewer      http://localhost:${PORT}/live`);
+  console.log(`  Health      http://localhost:${PORT}/health\n`);
   console.log(`  ⚠️  Comet → Settings → Assistant → Site access`);
   console.log(`     set localhost → Full access\n`);
 });

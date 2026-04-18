@@ -11,45 +11,69 @@
       position: fixed; bottom: 8px; right: 12px;
       font: 11px/1.4 monospace; color: #9a9a9a;
       background: rgba(0,0,0,.6); padding: 3px 8px;
-      border-radius: 4px; z-index: 99999;
-      pointer-events: none;
+      border-radius: 4px; z-index: 99999; pointer-events: none;
+    }
+    #comet-hint {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #b45309; color: #fff;
+      font: 13px/1.5 sans-serif; padding: 10px 16px;
+      z-index: 99999;
     }
   </style>
 </head>
 <body>
+  <!-- Comet site-access warning (shown if assistant appears blocked) -->
+  <div id="comet-hint">
+    ⚠️ Comet Assistant may not have access to this page.<br>
+    Go to <strong>Comet → Settings → Assistant → Site access</strong>
+    and set <code>localhost</code> to <strong>Full access</strong>, then reload.
+  </div>
+
   <div id="stage"></div>
   <div id="status">connecting…</div>
 
   <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   <script>
-    const status = document.getElementById('status');
-    const stage  = document.getElementById('stage');
+    const status    = document.getElementById('status');
+    const stage     = document.getElementById('stage');
+    const cometHint = document.getElementById('comet-hint');
 
     let replayer = null;
     let ready    = false;
     let mirror   = null;
 
-    // ── Action back-channel ──────────────────────────────────────────────────
+    // ── Comet site-access check ───────────────────────────────────────────────
+    // After 3 seconds, if window.__cometReady is never set by Comet's injected
+    // script, surface the hint banner. Comet sets this flag when it has full
+    // access to the page; absence suggests the domain is restricted.
+    setTimeout(() => {
+      if (!window.__cometReady && ready) {
+        cometHint.style.display = 'block';
+      }
+    }, 3000);
+
+    // ── Action back-channel ───────────────────────────────────────────────────
     const actWs = new WebSocket('ws://localhost:7000/actions');
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
     function sendAction(frame) {
-      if (actWs.readyState === WebSocket.OPEN) {
-        actWs.send(JSON.stringify(frame));
-      }
+      if (actWs.readyState === WebSocket.OPEN) actWs.send(JSON.stringify(frame));
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
     function stableAttrs(el) {
       return {
-        testId:    el.dataset?.testid ?? null,
-        ariaLabel: el.getAttribute?.('aria-label') ?? null,
+        testId:    el.dataset?.testid                  ?? null,
+        ariaLabel: el.getAttribute?.('aria-label')     ?? null,
+        role:      el.getAttribute?.('role')            ?? null,
+        // Include trimmed visible text (max 60 chars) for role+text fallback
+        text:      (el.textContent?.trim() ?? '').slice(0, 60) || null,
       };
     }
 
-    // Walk up the DOM tree to find the nearest node with a valid rrweb id.
-    // pplx.ai wraps many interactive elements in React portals; the click
-    // target may be a deep text node whose id is -1.
+    // Walk up to the nearest node with a valid rrweb id.
+    // pplx.ai wraps many targets in React portals with deeply nested spans.
     function nearestId(el) {
       let node = el;
       while (node && node !== document.documentElement) {
@@ -60,7 +84,7 @@
       return null;
     }
 
-    // ── Event interceptors (attached once iframe doc is ready) ───────────────
+    // ── Event interceptors ────────────────────────────────────────────────────
     function attachInterceptors(doc) {
 
       // CLICK
@@ -79,32 +103,28 @@
         e.stopPropagation();
       }, true);
 
-      // INPUT — forward the full current value so recorder can set it
+      // INPUT
       doc.addEventListener('input', (e) => {
         const hit = nearestId(e.target);
         if (!hit) return;
         sendAction({ type: 'input', id: hit.id, value: e.target.value ?? '' });
       }, true);
 
-      // KEYDOWN — forward Enter / special keys that pplx.ai listens to
+      // KEYDOWN — control keys only (Enter, Escape, Tab, arrow keys, shortcuts)
       doc.addEventListener('keydown', (e) => {
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return; // regular typing handled by input
         const hit = nearestId(e.target);
         if (!hit) return;
-        // Only forward if it's a control key; regular typing is handled by input
-        if (e.key.length === 1) return;
         sendAction({
-          type: 'keydown',
-          id:   hit.id,
-          key:  e.key,
-          code: e.code,
-          shiftKey: e.shiftKey,
-          ctrlKey:  e.ctrlKey,
-          metaKey:  e.metaKey,
+          type: 'keydown', id: hit.id,
+          key:  e.key,  code: e.code,
+          shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey,
         });
         e.preventDefault();
       }, true);
 
-      // SCROLL
+      // SCROLL — M4: forward all scroll events so pplx.ai's virtualized
+      // thread list loads new messages when Comet scrolls
       doc.addEventListener('scroll', (e) => {
         const el  = e.target;
         const hit = nearestId(el);
@@ -113,7 +133,7 @@
       }, true);
     }
 
-    // ── Replayer init ────────────────────────────────────────────────────────
+    // ── Replayer init ─────────────────────────────────────────────────────────
     function initReplayer() {
       replayer = new rrweb.Replayer([], {
         liveMode: true,
@@ -132,15 +152,9 @@
       });
     }
 
-    // ── rrweb event stream from relay ────────────────────────────────────────
-    const evtWs = new WebSocket('ws://localhost:7000/subscribe');
-
-    evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
-    evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
-    evtWs.onerror = () => { status.textContent = '⚠ relay error — is the relay running?'; };
-
-    // Batch incoming messages with rAF to avoid flooding the replayer
-    // during heavy pplx.ai streaming (up to 20 mutations/sec)
+    // ── rrweb event stream — M4: rAF-batched drain ───────────────────────────
+    // Batching prevents the replayer being called 20+ times per frame during
+    // heavy pplx.ai streaming, which would cause Comet to scan a moving DOM.
     const eventQueue = [];
     let draining = false;
 
@@ -150,13 +164,19 @@
       draining = false;
     }
 
+    const evtWs = new WebSocket('ws://localhost:7000/subscribe');
+
+    evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
+    evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
+    evtWs.onerror = () => { status.textContent = '⚠ relay error — is the relay running?'; };
+
     evtWs.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
 
       if (!ready) {
         initReplayer();
         ready = true;
-        status.textContent = '\u25cf live';
+        status.textContent = '● live';
       }
 
       eventQueue.push(event);

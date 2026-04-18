@@ -7,7 +7,7 @@ const RELAY_INGEST  = 'ws://localhost:7000/ingest';
 const RELAY_ACTIONS = 'ws://localhost:7000/actions';
 
 type ActionFrame =
-  | { type: 'click';   id: number; offsetX?: number; offsetY?: number; testId?: string | null; ariaLabel?: string | null }
+  | { type: 'click';   id: number; offsetX?: number; offsetY?: number; testId?: string | null; ariaLabel?: string | null; role?: string | null; text?: string | null }
   | { type: 'input';   id: number; value: string }
   | { type: 'keydown'; id: number; key: string; code: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }
   | { type: 'scroll';  id: number; x: number; y: number }
@@ -15,30 +15,40 @@ type ActionFrame =
 
 let rrwebMirror: Mirror | null = null;
 
-// ── Node resolution ──────────────────────────────────────────────────────────
+// ── Node resolution ───────────────────────────────────────────────────────────
+// Priority: rrweb mirror id → data-testid → aria-label → role+text heuristic
 function resolveNode(
   id: number,
-  testId?: string | null,
+  testId?:    string | null,
   ariaLabel?: string | null,
+  role?:      string | null,
+  text?:      string | null,
 ): Element | null {
+  // 1. Primary: rrweb mirror (fast, O(1))
   const node = rrwebMirror?.getNode(id);
   if (node instanceof Element) return node;
 
-  // Stale-id fallback — React reconciliation may have replaced the node
+  // 2. Stable attribute fallbacks (M4 stale-id recovery)
   if (testId) {
     const el = document.querySelector(`[data-testid="${CSS.escape(testId)}"]`);
-    if (el) { console.warn('[pplx-bridge] stale id → data-testid:', testId); return el; }
+    if (el) { console.warn('[pplx-bridge] stale-id → data-testid:', testId); return el; }
   }
   if (ariaLabel) {
     const el = document.querySelector(`[aria-label="${CSS.escape(ariaLabel)}"]`);
-    if (el) { console.warn('[pplx-bridge] stale id → aria-label:', ariaLabel); return el; }
+    if (el) { console.warn('[pplx-bridge] stale-id → aria-label:', ariaLabel); return el; }
+  }
+  // 3. Role + visible text heuristic (last resort)
+  if (role && text) {
+    const candidates = Array.from(document.querySelectorAll(`[role="${CSS.escape(role)}"]`));
+    const match = candidates.find(el => el.textContent?.trim() === text);
+    if (match) { console.warn('[pplx-bridge] stale-id → role+text:', role, text); return match; }
   }
 
   console.error('[pplx-bridge] cannot resolve node id:', id);
   return null;
 }
 
-// ── Action executor ──────────────────────────────────────────────────────────
+// ── Action executor ───────────────────────────────────────────────────────────
 function executeAction(act: ActionFrame): void {
   if (act.type === 'cdp') {
     chrome.runtime.sendMessage({ type: 'cdp', method: act.method, params: act.params });
@@ -47,39 +57,31 @@ function executeAction(act: ActionFrame): void {
 
   const node = resolveNode(
     act.id,
-    act.type === 'click' ? (act.testId   ?? null) : null,
+    act.type === 'click' ? (act.testId    ?? null) : null,
     act.type === 'click' ? (act.ariaLabel ?? null) : null,
+    act.type === 'click' ? (act.role      ?? null) : null,
+    act.type === 'click' ? (act.text      ?? null) : null,
   );
   if (!node) return;
 
   switch (act.type) {
     case 'click':
-      node.dispatchEvent(
-        new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }),
-      );
-      node.dispatchEvent(
-        new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }),
-      );
-      node.dispatchEvent(
-        new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }),
-      );
+      // Fire full mousedown → mouseup → click sequence
+      for (const type of ['mousedown', 'mouseup', 'click'] as const) {
+        node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
       break;
 
     case 'input': {
-      // pplx.ai composer is a React controlled ProseMirror/contenteditable.
-      // Strategy: focus → select-all → insertText via execCommand (works in
-      // Chromium for contenteditable) → fallback to InputEvent for <textarea>.
       const el = node as HTMLElement;
       el.focus();
-
       if (el.isContentEditable) {
-        // ProseMirror / Lexical editor (pplx.ai main composer)
+        // ProseMirror / Lexical (pplx.ai main composer)
         document.execCommand('selectAll', false);
         document.execCommand('insertText', false, act.value);
       } else {
-        // Plain <textarea> or <input>
+        // Plain <textarea> / <input> — native setter bypasses React's wiring
         const input = el as HTMLInputElement | HTMLTextAreaElement;
-        // Native setter trick to bypass React's synthetic event wiring
         const nativeSetter = Object.getOwnPropertyDescriptor(
           Object.getPrototypeOf(input), 'value'
         )?.set;
@@ -93,28 +95,18 @@ function executeAction(act: ActionFrame): void {
     case 'keydown': {
       const el = node as HTMLElement;
       el.focus();
-      el.dispatchEvent(new KeyboardEvent('keydown', {
-        key:      act.key,
-        code:     act.code,
-        bubbles:  true,
-        cancelable: true,
-        shiftKey: act.shiftKey,
-        ctrlKey:  act.ctrlKey,
-        metaKey:  act.metaKey,
-      }));
-      // Also fire keyup so pplx.ai's keyboard handlers complete
-      el.dispatchEvent(new KeyboardEvent('keyup', {
-        key:      act.key,
-        code:     act.code,
-        bubbles:  true,
-        shiftKey: act.shiftKey,
-        ctrlKey:  act.ctrlKey,
-        metaKey:  act.metaKey,
-      }));
+      for (const type of ['keydown', 'keyup'] as const) {
+        el.dispatchEvent(new KeyboardEvent(type, {
+          key: act.key, code: act.code,
+          bubbles: true, cancelable: true,
+          shiftKey: act.shiftKey, ctrlKey: act.ctrlKey, metaKey: act.metaKey,
+        }));
+      }
       break;
     }
 
     case 'scroll':
+      // Scroll the real element; mutations flow back through rrweb automatically
       (node as Element).scrollTo(act.x, act.y);
       break;
   }
@@ -122,10 +114,7 @@ function executeAction(act: ActionFrame): void {
 
 // ── WebSocket connections ─────────────────────────────────────────────────────
 function startRecorder(): void {
-  let stopped = false;
-
   function connectIngest(): void {
-    if (stopped) return;
     const ws = new WebSocket(RELAY_INGEST);
 
     ws.onopen = () => {
@@ -140,8 +129,8 @@ function startRecorder(): void {
         recordShadowDOM:  true,
         recordCanvas:     true,
         inlineImages:     false,
-        // Throttle: emit at most one mutation batch per animation frame
-        // to avoid overwhelming the relay during pplx.ai streaming
+        // Slim down the snapshot: strip noise that bloats the stream
+        // without affecting Comet's ability to read / interact with the DOM
         slimDOMOptions: {
           script:               true,
           comment:              true,
@@ -154,7 +143,7 @@ function startRecorder(): void {
         },
       });
 
-      // rrweb v2: mirror lives on the record function
+      // rrweb v2: mirror lives on the record function itself
       rrwebMirror = (record as unknown as { mirror: Mirror }).mirror;
 
       ws.onclose = () => {
@@ -169,7 +158,6 @@ function startRecorder(): void {
   }
 
   function connectActions(): void {
-    if (stopped) return;
     const ws = new WebSocket(RELAY_ACTIONS);
 
     ws.onmessage = ({ data }: MessageEvent<string>) => {

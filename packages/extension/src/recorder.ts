@@ -6,16 +6,19 @@ import type { Mirror } from 'rrweb-snapshot';
 
 type ActionFrame =
   | { type: 'click';   id: number; offsetX?: number; offsetY?: number; testId?: string | null; ariaLabel?: string | null; role?: string | null; text?: string | null }
-  | { type: 'input';   id: number; value: string }
-  | { type: 'keydown'; id: number; key: string; code: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }
+  | { type: 'type';    id: number; value: string }   // full string to set on element
+  | { type: 'input';   id: number; value: string }   // legacy alias for type
+  | { type: 'keydown'; id: number | null; key: string; code: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }
   | { type: 'scroll';  id: number; x: number; y: number }
   | { type: 'cdp';     method: string; params: Record<string, unknown> };
 
 let rrwebMirror: Mirror | null = null;
 
-function resolveNode(id: number, testId?: string | null, ariaLabel?: string | null, role?: string | null, text?: string | null): Element | null {
-  const node = rrwebMirror?.getNode(id);
-  if (node instanceof Element) return node;
+function resolveNode(id: number | null, testId?: string | null, ariaLabel?: string | null, role?: string | null, text?: string | null): Element | null {
+  if (id !== null) {
+    const node = rrwebMirror?.getNode(id);
+    if (node instanceof Element) return node;
+  }
 
   if (testId) {
     const el = document.querySelector(`[data-testid="${CSS.escape(testId)}"]`);
@@ -35,6 +38,39 @@ function resolveNode(id: number, testId?: string | null, ariaLabel?: string | nu
   return null;
 }
 
+// Set text on any element React-style: works for input, textarea, contenteditable.
+function setNativeValue(el: HTMLElement, value: string): void {
+  el.focus();
+
+  if (el.isContentEditable) {
+    // Clear and set via Selection API — works reliably in React apps
+    el.textContent = '';
+    const range = document.createRange();
+    const sel   = window.getSelection();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    document.execCommand('insertText', false, value);
+    // Fallback: if execCommand didn't work, set directly and fire events
+    if (el.textContent !== value) {
+      el.textContent = value;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+    }
+  } else {
+    const input = el as HTMLInputElement | HTMLTextAreaElement;
+    const proto = Object.getPrototypeOf(input);
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (nativeSetter) {
+      nativeSetter.call(input, value);
+    } else {
+      input.value = value;
+    }
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
 function executeAction(act: ActionFrame): void {
   if (act.type === 'cdp') {
     chrome.runtime.sendMessage({ type: 'cdp', method: act.method, params: act.params });
@@ -42,7 +78,7 @@ function executeAction(act: ActionFrame): void {
   }
 
   const node = resolveNode(
-    act.id,
+    'id' in act ? act.id : null,
     act.type === 'click' ? (act.testId    ?? null) : null,
     act.type === 'click' ? (act.ariaLabel ?? null) : null,
     act.type === 'click' ? (act.role      ?? null) : null,
@@ -57,30 +93,26 @@ function executeAction(act: ActionFrame): void {
       }
       break;
 
-    case 'input': {
-      const el = node as HTMLElement;
-      el.focus();
-      if (el.isContentEditable) {
-        document.execCommand('selectAll', false);
-        document.execCommand('insertText', false, act.value);
-      } else {
-        const input = el as HTMLInputElement | HTMLTextAreaElement;
-        const nativeSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(input), 'value')?.set;
-        nativeSetter?.call(input, act.value);
-        input.dispatchEvent(new Event('input',  { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
+    case 'type':
+    case 'input':
+      setNativeValue(node as HTMLElement, act.value);
       break;
-    }
 
     case 'keydown': {
-      const el = node as HTMLElement;
-      el.focus();
-      for (const type of ['keydown', 'keyup'] as const) {
-        el.dispatchEvent(new KeyboardEvent(type, {
+      const target = (node as HTMLElement);
+      target.focus();
+      for (const evtType of ['keydown', 'keypress', 'keyup'] as const) {
+        target.dispatchEvent(new KeyboardEvent(evtType, {
           key: act.key, code: act.code, bubbles: true, cancelable: true,
           shiftKey: act.shiftKey, ctrlKey: act.ctrlKey, metaKey: act.metaKey,
         }));
+      }
+      // For Enter on contenteditable / form submission
+      if (act.key === 'Enter') {
+        const form = target.closest('form');
+        if (form) {
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+        }
       }
       break;
     }
@@ -92,11 +124,8 @@ function executeAction(act: ActionFrame): void {
 }
 
 function startRecorder(): void {
-  // Connect to the background service worker which owns the WebSockets.
-  // The background SW is an extension context and is not subject to PNA.
   const port = chrome.runtime.connect({ name: 'pplx-recorder' });
 
-  // Receive action frames forwarded from the relay via the background SW
   port.onMessage.addListener((msg: { type: string; data: string }) => {
     if (msg.type === 'action') {
       try { executeAction(JSON.parse(msg.data) as ActionFrame); }
@@ -109,7 +138,6 @@ function startRecorder(): void {
     setTimeout(startRecorder, 2000);
   });
 
-  // Start rrweb recording; emit each event through the port to the background SW
   const stop = record({
     emit(event) {
       port.postMessage({ type: 'rrweb', data: JSON.stringify(event) });
@@ -117,7 +145,7 @@ function startRecorder(): void {
     inlineStylesheet: true,
     collectFonts:     true,
     recordShadowDOM:  true,
-    recordCanvas:     false,   // disabled: causes makeProxy crash on screen.height in MV3
+    recordCanvas:     false,
     inlineImages:     false,
     slimDOMOptions: {
       script: true, comment: true, headFavicon: true, headWhitespace: true,
@@ -129,7 +157,6 @@ function startRecorder(): void {
 
   console.log('[pplx-bridge] recorder started → events piped via background SW');
 
-  // Clean up rrweb when the port dies
   port.onDisconnect.addListener(() => stop?.());
 }
 

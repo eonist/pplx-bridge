@@ -1,23 +1,17 @@
 // background.ts — service worker
-// Uses chrome.tabs.captureVisibleTab() which IS available in MV3 service workers.
-// Polls at FPS interval, encodes each frame as JPEG, sends binary to relay /stream/push.
-// Also opens /actions WS and injects received actions into the target tab.
-
 const RELAY   = 'ws://localhost:7001';
 const FPS     = 8;
 const QUALITY = 0.6;
+const SCROLL_MULTIPLIER = 12; // wheel deltaY is tiny — scale up
 
-let capturing  = false;
-let intervalId = 0;
+let capturing   = false;
+let intervalId  = 0;
+let keepAliveId = 0;
 let streamWs: WebSocket | null = null;
 let actWs: WebSocket | null = null;
 
 chrome.action.onClicked.addListener(async (tab) => {
-  if (capturing) {
-    // Second click = stop
-    stopCapture();
-    return;
-  }
+  if (capturing) { stopCapture(); return; }
   if (!tab.id || !tab.windowId) return;
   const tabId    = tab.id;
   const windowId = tab.windowId;
@@ -25,7 +19,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   capturing = true;
   console.log('[bg] starting capture for tab', tabId);
 
-  // ── 1. Open stream WS ──────────────────────────────────────────────────
+  // ── 1. Stream WS ──────────────────────────────────────────────────────
   streamWs = new WebSocket(`${RELAY}/stream/push`);
   await new Promise<void>((resolve, reject) => {
     streamWs!.onopen  = () => resolve();
@@ -33,21 +27,15 @@ chrome.action.onClicked.addListener(async (tab) => {
   });
   console.log('[bg] stream WS connected');
 
-  // ── 2. Frame loop via captureVisibleTab ───────────────────────────────
-  // captureVisibleTab returns a data URL (jpeg); we convert to binary ArrayBuffer.
+  // ── 2. Frame loop ─────────────────────────────────────────────────────
   intervalId = setInterval(async () => {
-    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) {
-      stopCapture();
-      return;
-    }
+    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
         format: 'jpeg',
         quality: Math.round(QUALITY * 100),
       });
-      // Convert data URL to ArrayBuffer and send
-      const binary = dataUrlToBuffer(dataUrl);
-      if (streamWs.readyState === WebSocket.OPEN) streamWs.send(binary);
+      if (streamWs.readyState === WebSocket.OPEN) streamWs.send(dataUrlToBuffer(dataUrl));
     } catch (err) {
       console.warn('[bg] captureVisibleTab error:', err);
     }
@@ -57,29 +45,37 @@ chrome.action.onClicked.addListener(async (tab) => {
   actWs = new WebSocket(`${RELAY}/actions`);
   actWs.onopen = () => {
     actWs!.send(JSON.stringify({ register: 'extension' }));
-    console.log('[bg] actions WS connected, registered as extension');
+    console.log('[bg] actions WS connected');
   };
   actWs.onmessage = async (msg) => {
     let action: Record<string, unknown>;
     try { action = JSON.parse(msg.data); } catch { return; }
-    console.log('[bg] action received:', action);
+    if (action.type !== 'mousemove') console.log('[bg] action:', action.type, action);
     try {
-      await chrome.scripting.executeScript({
+      const result = await chrome.scripting.executeScript({
         target: { tabId },
         world: 'MAIN',
         func: injectAction,
         args: [action],
       });
+      if (action.type === 'click') console.log('[bg] executeScript result:', JSON.stringify(result));
     } catch (err) {
       console.error('[bg] executeScript error:', err);
     }
   };
-  actWs.onclose = () => console.warn('[bg] actions WS closed');
+  actWs.onclose = () => { console.warn('[bg] actions WS closed'); };
+
+  // ── 4. Keep-alive: chrome.runtime.getPlatformInfo every 20s ───────────
+  // MV3 service workers idle-kill after ~30s; this prevents that.
+  keepAliveId = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => { /* keep SW alive */ });
+  }, 20_000) as unknown as number;
 });
 
 function stopCapture() {
   capturing = false;
   clearInterval(intervalId);
+  clearInterval(keepAliveId);
   streamWs?.close();
   actWs?.close();
   streamWs = null;
@@ -87,7 +83,6 @@ function stopCapture() {
   console.log('[bg] capture stopped');
 }
 
-// Convert a JPEG data URL to an ArrayBuffer
 function dataUrlToBuffer(dataUrl: string): ArrayBuffer {
   const base64 = dataUrl.split(',')[1];
   const binary = atob(base64);
@@ -96,20 +91,22 @@ function dataUrlToBuffer(dataUrl: string): ArrayBuffer {
   return buf.buffer;
 }
 
-// ── Injector (serialised into page context via executeScript) ──────────────────
+// ── Injector (runs inside page context via executeScript) ──────────────────
 function injectAction(action: Record<string, unknown>) {
+  const SCROLL_MULTIPLIER = 12;
   const type = action.type as string;
 
   if (type === 'click' || type === 'mousemove') {
-    const x = (action.x as number) * window.innerWidth;
-    const y = (action.y as number) * window.innerHeight;
+    const x  = (action.x as number) * window.innerWidth;
+    const y  = (action.y as number) * window.innerHeight;
     const el = document.elementFromPoint(x, y) as HTMLElement | null;
-    if (!el) return;
+    if (!el) return `no element at (${x.toFixed(0)}, ${y.toFixed(0)})`;
     if (type === 'click') {
       el.focus();
       el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
       el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, clientX: x, clientY: y }));
       el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      return `clicked ${el.tagName} #${el.id} .${el.className}`;
     } else {
       el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
     }
@@ -117,19 +114,18 @@ function injectAction(action: Record<string, unknown>) {
   }
 
   if (type === 'type') {
-    const value = action.value as string;
-    const el = document.activeElement as HTMLElement | null;
-    if (!el) return;
+    const char = action.value as string;
+    const el   = document.activeElement as HTMLElement | null;
+    if (!el) return 'no active element';
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
       const proto  = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      setter?.call(el, value);
-      el.dispatchEvent(new InputEvent('input',  { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      // Append character to current value (don't replace)
+      setter?.call(el, el.value + char);
+      el.dispatchEvent(new InputEvent('input',  { bubbles: true, data: char, inputType: 'insertText' }));
     } else if ((el as HTMLElement).isContentEditable) {
       el.focus();
-      document.execCommand('selectAll', false);
-      document.execCommand('insertText', false, value);
+      document.execCommand('insertText', false, char);
     }
     return;
   }
@@ -138,20 +134,33 @@ function injectAction(action: Record<string, unknown>) {
     const el = document.activeElement as HTMLElement | null;
     if (!el) return;
     const init: KeyboardEventInit = {
-      key:        action.key      as string,
-      code:       action.code     as string,
-      shiftKey:   (action.shiftKey as boolean) ?? false,
-      ctrlKey:    (action.ctrlKey  as boolean) ?? false,
-      metaKey:    (action.metaKey  as boolean) ?? false,
-      bubbles:    true,
-      cancelable: true,
+      key: action.key as string, code: action.code as string,
+      shiftKey: (action.shiftKey as boolean) ?? false,
+      ctrlKey:  (action.ctrlKey  as boolean) ?? false,
+      metaKey:  (action.metaKey  as boolean) ?? false,
+      bubbles: true, cancelable: true,
     };
     el.dispatchEvent(new KeyboardEvent('keydown', init));
     el.dispatchEvent(new KeyboardEvent('keyup',   init));
+    // Handle Enter/Backspace natively on inputs
+    if (action.key === 'Enter' && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
+      el.form?.requestSubmit();
+    }
+    if (action.key === 'Backspace' && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
+      const proto  = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      setter?.call(el, el.value.slice(0, -1));
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+    }
     return;
   }
 
   if (type === 'scroll') {
-    window.scrollBy(action.x as number, action.y as number);
+    const dx = (action.x as number) * SCROLL_MULTIPLIER;
+    const dy = (action.y as number) * SCROLL_MULTIPLIER;
+    window.scrollBy(dx, dy);
+    // Also try scrolling the element under centre
+    const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) as HTMLElement | null;
+    el?.scrollBy?.(dx, dy);
   }
 }

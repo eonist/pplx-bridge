@@ -29,7 +29,6 @@
     let mirror   = null;
     let ready    = false;
 
-    // ── Actions channel (viewer → relay → recorder) ──────────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -56,51 +55,60 @@
       return null;
     }
 
-    function attachInterceptors(doc) {
-      doc.addEventListener('click', (e) => {
-        const hit = nearestId(e.target);
+    // Clicks land on the outer #stage (iframe has pointer-events:none).
+    // Translate outer coords -> iframe-local coords via elementFromPoint.
+    function attachOuterInterceptors() {
+      const iframe = stage.querySelector('iframe');
+
+      stage.setAttribute('tabindex', '0');
+
+      stage.addEventListener('click', (e) => {
+        if (!mirror || !iframe) return;
+        const rect = iframe.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const doc = iframe.contentDocument;
+        if (!doc) return;
+        const target = doc.elementFromPoint(x, y);
+        if (!target) return;
+        const hit = nearestId(target);
         if (!hit) return;
-        const rect = hit.node.getBoundingClientRect();
+        const elRect = hit.node.getBoundingClientRect();
         sendAction({ type: 'click', id: hit.id,
-          offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top,
+          offsetX: x - elRect.left, offsetY: y - elRect.top,
           ...stableAttrs(hit.node) });
-        e.preventDefault(); e.stopPropagation();
-      }, true);
+      });
 
-      doc.addEventListener('input', (e) => {
-        const hit = nearestId(e.target);
-        if (!hit) return;
-        sendAction({ type: 'input', id: hit.id, value: e.target.value ?? '' });
-      }, true);
-
-      doc.addEventListener('keydown', (e) => {
+      stage.addEventListener('keydown', (e) => {
+        if (!mirror) return;
         if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
-        const hit = nearestId(e.target);
-        if (!hit) return;
-        sendAction({ type: 'keydown', id: hit.id, key: e.key, code: e.code,
+        const doc = iframe?.contentDocument;
+        const target = doc?.activeElement ?? null;
+        const hit = target ? nearestId(target) : null;
+        sendAction({ type: 'keydown', id: hit?.id ?? null, key: e.key, code: e.code,
           shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey });
         e.preventDefault();
-      }, true);
+      });
 
-      doc.addEventListener('scroll', (e) => {
-        const el = e.target;
-        const hit = nearestId(el);
+      stage.addEventListener('input', (e) => {
+        if (!mirror) return;
+        const doc = iframe?.contentDocument;
+        const target = doc?.activeElement ?? null;
+        const hit = target ? nearestId(target) : null;
         if (!hit) return;
-        sendAction({ type: 'scroll', id: hit.id, x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
-      }, true);
+        sendAction({ type: 'input', id: hit.id, value: e.target?.value ?? '' });
+      });
     }
 
-    // ── Replayer ──────────────────────────────────────────────────────────────
     function fixIframePosition() {
       const iframe = stage.querySelector('iframe');
       if (iframe) {
-        iframe.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;';
+        // pointer-events:none so clicks fall through to the outer #stage listener
+        iframe.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;pointer-events:none;';
       }
     }
 
     function initReplayer(firstEvent) {
-      // Re-timestamp the first event to "now" so liveMode doesn't treat it
-      // as ancient history and refuse to render it.
       const now = Date.now();
       const offset = now - firstEvent.timestamp;
       firstEvent.timestamp = now;
@@ -112,19 +120,16 @@
       });
 
       replayer.on('iframe-loaded', () => {
-        const doc = replayer.iframe?.contentDocument;
-        if (!doc) return;
         mirror = replayer.getMirror();
-        attachInterceptors(doc);
       });
 
       replayer.startLive(now);
 
-      // Force the rrweb-injected iframe to sit flush at top:0 left:0
-      // regardless of the recorded page's original viewport offset.
-      requestAnimationFrame(fixIframePosition);
+      requestAnimationFrame(() => {
+        fixIframePosition();
+        attachOuterInterceptors();
+      });
 
-      // Expose offset so subsequent events can be re-stamped too
       replayer.__tsOffset = offset;
     }
 
@@ -135,14 +140,12 @@
       if (!replayer) { draining = false; return; }
       const batch = eventQueue.splice(0);
       for (const evt of batch) {
-        // Re-timestamp incoming events by the same offset applied to the snapshot
         evt.timestamp += (replayer.__tsOffset ?? 0);
         replayer.addEvent(evt);
       }
       draining = false;
     }
 
-    // ── Subscribe channel (relay → viewer) ───────────────────────────────────
     const evtWs = new WebSocket(`ws://localhost:${PORT}/subscribe`);
     evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
     evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
@@ -152,20 +155,11 @@
       const event = JSON.parse(msg.data);
 
       if (!ready) {
-        // First event must be Meta (4) or FullSnapshot (2).
-        // Skip anything else until we get one.
         if (event.type !== 2 && event.type !== 4) return;
-        if (event.type === 4) {
-          // Meta event — queue it, wait for the FullSnapshot next
-          eventQueue.push(event);
-          return;
-        }
-        // FullSnapshot — now we can boot the replayer
-        // Flush any queued meta first with matching re-timestamp
+        if (event.type === 4) { eventQueue.push(event); return; }
         const now = Date.now();
         for (const e of eventQueue) e.timestamp = now - 1;
         eventQueue.length = 0;
-
         initReplayer(event);
         ready = true;
         status.textContent = '● live';

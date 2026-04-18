@@ -5,32 +5,32 @@
   <title>pplx-bridge live viewer</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; background: #0e0e0e; }
-    #stage { width: 100vw; height: 100vh; position: relative; overflow: hidden; }
+    html, body { width: 100%; height: 100%; background: #0e0e0e; overflow: hidden; }
     #status {
       position: fixed; bottom: 8px; right: 12px;
       font: 11px/1.4 monospace; color: #9a9a9a;
       background: rgba(0,0,0,.6); padding: 3px 8px;
       border-radius: 4px; z-index: 99999; pointer-events: none;
     }
+    /* rrweb injects its shadow-host directly into <body>; make it fill viewport */
+    body > .replayer-wrapper,
+    body > iframe {
+      position: fixed !important;
+      top: 0 !important; left: 0 !important;
+      width: 100vw !important; height: 100vh !important;
+      border: none !important;
+      pointer-events: auto !important;
+      transform-origin: top left !important;
+    }
   </style>
 </head>
 <body>
-  <div id="stage"></div>
   <div id="status">connecting…</div>
 
-  <!--
-    Use the latest stable rrweb 1.x build. The 2.x alpha makeProxy crash is in the
-    *recorded page* context (not the viewer), so it does not block anything here.
-    The "iframe-loaded" event name only exists in newer rrweb 2.x builds. For
-    rrweb 1.x the replayer embeds the snapshot directly into its own shadow root
-    (no nested iframe), so we poll for mirror readiness instead.
-  -->
   <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   <script>
     const PORT   = 7001;
     const status = document.getElementById('status');
-    const stage  = document.getElementById('stage');
 
     let replayer    = null;
     let mirror      = null;
@@ -47,26 +47,27 @@
     function stableAttrs(el) {
       return {
         testId:    el.dataset?.testid              ?? null,
-        ariaLabel: el.getAttribute('aria-label')   ?? null,
-        role:      el.getAttribute('role')          ?? null,
+        ariaLabel: el.getAttribute?.('aria-label') ?? null,
+        role:      el.getAttribute?.('role')        ?? null,
         text:      (el.textContent?.trim() ?? '').slice(0, 60) || null,
       };
     }
 
     function nearestId(el) {
+      if (!mirror) return null;
       let node = el;
-      while (node && node !== document.documentElement) {
-        const id = mirror.getId(node);
-        if (id !== -1) return { id, node };
+      while (node && node.nodeType === 1) {
+        try {
+          const id = mirror.getId(node);
+          if (id && id !== -1) return { id, node };
+        } catch (_) {}
         node = node.parentElement;
       }
       return null;
     }
 
     function attachInterceptors(root) {
-      // root is either the replayer iframe's contentDocument, or stage itself
       root.addEventListener('click', (e) => {
-        if (!mirror) return;
         const hit = nearestId(e.target);
         if (!hit) return;
         const rect = hit.node.getBoundingClientRect();
@@ -77,7 +78,6 @@
       }, true);
 
       root.addEventListener('input', (e) => {
-        if (!mirror) return;
         const hit = nearestId(e.target);
         if (!hit) return;
         sendAction({ type: 'type', id: hit.id,
@@ -85,7 +85,6 @@
       }, true);
 
       root.addEventListener('keydown', (e) => {
-        if (!mirror) return;
         const isSpecial = e.key.length > 1 || e.ctrlKey || e.metaKey;
         if (!isSpecial) return;
         const hit = nearestId(e.target);
@@ -96,7 +95,6 @@
       }, true);
 
       root.addEventListener('scroll', (e) => {
-        if (!mirror) return;
         const el = e.target;
         const hit = nearestId(el);
         if (!hit) return;
@@ -104,69 +102,79 @@
           x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
       }, true);
 
-      console.log('[viewer] interceptors attached to', root === document ? 'viewer doc' : 'iframe doc');
+      console.log('[viewer] interceptors attached to', root.nodeName ?? 'root');
     }
 
-    // rrweb 1.x renders into a shadow-root inside #stage — no nested iframe.
-    // rrweb 2.x renders into an iframe inside #stage.
-    // Either way, we poll until getMirror() works (has a nodeMap) and the
-    // rendered DOM is available, then attach once.
-    function pollForMirror() {
-      if (!replayer || intercepted) return;
+    function grabMirrorAndAttach() {
+      if (intercepted) return;
 
-      // Try getMirror (exists in both 1.x and 2.x)
+      // Grab mirror — try every known property across rrweb versions
       let m = null;
       try { m = replayer.getMirror?.(); } catch (_) {}
-      // Fallback: replayer.mirror is the raw object in some builds
       if (!m) m = replayer.mirror ?? null;
+      if (!m) m = replayer.iframe?.contentWindow?.__rrweb_mirror ?? null;
 
-      const hasNodes = m && (
-        (typeof m.getNode === 'function') ||
-        (m.map && Object.keys(m.map).length > 0) ||
-        (m._nodeToId && m._nodeToId.size > 0)
-      );
-
-      if (!hasNodes) {
-        requestAnimationFrame(pollForMirror);
+      if (!m) {
+        console.warn('[viewer] mirror not found yet, keys:', Object.keys(replayer));
         return;
       }
 
       mirror = m;
       intercepted = true;
-      console.log('[viewer] mirror ready');
+      console.log('[viewer] mirror ready. mirror keys:', Object.keys(mirror));
 
       if (typeof replayer.enableInteract === 'function') replayer.enableInteract();
 
-      // Attach to iframe doc if present, else shadow-root host, else stage
-      const iframe = stage.querySelector('iframe');
-      if (iframe) {
-        iframe.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;pointer-events:auto;';
-        const doc = iframe.contentDocument;
-        if (doc) { attachInterceptors(doc); return; }
+      // Determine where rrweb rendered the DOM:
+      // 1. An <iframe> directly in body
+      const bodyIframe = document.body.querySelector(':scope > iframe');
+      if (bodyIframe?.contentDocument) {
+        console.log('[viewer] attaching to body>iframe contentDocument');
+        attachInterceptors(bodyIframe.contentDocument);
+        return;
       }
-      // Shadow-root path (rrweb 1.x)
-      const host = stage.firstElementChild;
-      if (host?.shadowRoot) { attachInterceptors(host.shadowRoot); return; }
-      // Fallback: attach to stage itself
-      attachInterceptors(stage);
+      // 2. A shadow-root wrapper in body
+      const shadowHost = Array.from(document.body.children)
+        .find(el => el.shadowRoot && el.id !== 'status');
+      if (shadowHost?.shadowRoot) {
+        console.log('[viewer] attaching to shadow root');
+        attachInterceptors(shadowHost.shadowRoot);
+        return;
+      }
+      // 3. replayer.iframe (rrweb 2.x)
+      if (replayer.iframe?.contentDocument) {
+        console.log('[viewer] attaching to replayer.iframe contentDocument');
+        attachInterceptors(replayer.iframe.contentDocument);
+        return;
+      }
+      // 4. Fallback: top-level document
+      console.log('[viewer] fallback: attaching to document');
+      attachInterceptors(document);
+    }
+
+    function schedulePoll() {
+      if (intercepted) return;
+      requestAnimationFrame(() => {
+        grabMirrorAndAttach();
+        if (!intercepted) setTimeout(schedulePoll, 200);
+      });
     }
 
     function initReplayer(firstEvent) {
-      const now = Date.now();
+      const now    = Date.now();
       const offset = now - firstEvent.timestamp;
       firstEvent.timestamp = now;
 
       replayer = new rrweb.Replayer([firstEvent], {
         liveMode: true,
-        root: stage,
         UNSAFE_replayCanvas: false,
       });
 
       replayer.startLive(now);
       replayer.__tsOffset = offset;
 
-      // Start polling — mirror becomes available after first incremental snapshot
-      requestAnimationFrame(pollForMirror);
+      // Poll until mirror is available
+      schedulePoll();
     }
 
     const eventQueue = [];
@@ -179,8 +187,7 @@
         evt.timestamp += (replayer.__tsOffset ?? 0);
         replayer.addEvent(evt);
       }
-      // Keep polling for mirror after each batch in case it just became ready
-      if (!intercepted) requestAnimationFrame(pollForMirror);
+      if (!intercepted) schedulePoll();
       draining = false;
     }
 

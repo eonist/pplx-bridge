@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "scripts": {
     "build": "pnpm -r build",
-    "dev": "pnpm -r --parallel dev",
-    "start": "concurrently -n relay,chrome -c cyan,yellow \"node packages/relay/dist/index.js\" \"bash scripts/launch-chrome.sh\""
+    "dev":   "pnpm -r --parallel dev",
+    "start": "pnpm build && concurrently -n relay,chrome -c cyan,yellow \"node packages/relay/dist/index.js\" \"bash scripts/launch-chrome.sh\""
   },
   "devDependencies": {
     "concurrently": "^8.2.2",

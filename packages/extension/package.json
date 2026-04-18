@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/manifest.json dist/manifest.json",
-    "dev": "tsc -p tsconfig.json --watch"
+    "build": "node build.mjs",
+    "dev": "node --watch build.mjs"
   },
   "dependencies": {
     "rrweb": "^2.0.0-alpha.13"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",
-    "@types/node": "^20.12.7"
+    "@types/node": "^20.12.7",
+    "esbuild": "^0.21.3"
   }
 }

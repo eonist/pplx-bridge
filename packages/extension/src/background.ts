@@ -1,25 +1,31 @@
-// background.ts — service worker, handles CDP fallback for gesture-gated actions
-// Receives messages from recorder.ts via chrome.runtime.sendMessage
+// background.ts — MV3 service worker
+// Handles CDP fallback for gesture-gated actions (file upload, clipboard, etc.)
+// chrome.debugger requires the "debugger" manifest permission.
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.type !== 'cdp') return;
+chrome.runtime.onMessage.addListener(
+  (msg: { type: string; method: string; params?: Record<string, unknown> }, _sender, sendResponse) => {
+    if (msg.type !== 'cdp') return false;
 
-  // Get the active tab to attach the debugger
-  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-    const tab = tabs[0];
-    if (!tab?.id) return;
-    const tabId = tab.id;
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tabId = tabs[0]?.id;
+      if (!tabId) { sendResponse({ ok: false, error: 'no active tab' }); return; }
 
-    try {
-      await chrome.debugger.attach({ tabId }, '1.3');
-      await chrome.debugger.sendCommand({ tabId }, msg.method, msg.params ?? {});
-      await chrome.debugger.detach({ tabId });
-      sendResponse({ ok: true });
-    } catch (err) {
-      console.error('[pplx-bridge background] CDP error:', err);
-      sendResponse({ ok: false, error: String(err) });
-    }
-  });
+      try {
+        // Attach may throw if already attached — swallow and continue
+        try { await chrome.debugger.attach({ tabId }, '1.3'); } catch { /* already attached */ }
 
-  return true; // keep message channel open for async response
-});
+        await chrome.debugger.sendCommand({ tabId }, msg.method, msg.params ?? {});
+
+        // Detach only if we attached; safe to always try
+        try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
+
+        sendResponse({ ok: true });
+      } catch (err) {
+        console.error('[pplx-bridge background] CDP error:', err);
+        sendResponse({ ok: false, error: String(err) });
+      }
+    });
+
+    return true; // keep channel open for async response
+  },
+);

@@ -1,11 +1,8 @@
 // recorder.ts — MV3 content script on perplexity.ai
+// WebSockets live in the background service worker (exempt from PNA).
+// This script records via rrweb and shuttles events through a chrome.runtime port.
 import { record } from 'rrweb';
 import type { Mirror } from 'rrweb-snapshot';
-
-// macOS uses 7000 for AirPlay — match relay default
-const PORT           = 7001;
-const RELAY_INGEST   = `ws://localhost:${PORT}/ingest`;
-const RELAY_ACTIONS  = `ws://localhost:${PORT}/actions`;
 
 type ActionFrame =
   | { type: 'click';   id: number; offsetX?: number; offsetY?: number; testId?: string | null; ariaLabel?: string | null; role?: string | null; text?: string | null }
@@ -95,42 +92,45 @@ function executeAction(act: ActionFrame): void {
 }
 
 function startRecorder(): void {
-  function connectIngest(): void {
-    const ws = new WebSocket(RELAY_INGEST);
-    ws.onopen = () => {
-      console.log('[pplx-bridge] ingest connected');
-      const stop = record({
-        emit(event) {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
-        },
-        inlineStylesheet: true,
-        collectFonts:     true,
-        recordShadowDOM:  true,
-        recordCanvas:     false,   // disabled: causes makeProxy crash on screen.height in MV3
-        inlineImages:     false,
-        slimDOMOptions: {
-          script: true, comment: true, headFavicon: true, headWhitespace: true,
-          headMetaSocial: true, headMetaRobots: true, headMetaHttpEquiv: true, headMetaVerification: true,
-        },
-      });
-      rrwebMirror = (record as unknown as { mirror: Mirror }).mirror;
-      ws.onclose = () => { stop?.(); rrwebMirror = null; console.warn('[pplx-bridge] ingest closed — reconnecting'); setTimeout(connectIngest, 2000); };
-    };
-    ws.onerror = () => ws.close();
-  }
+  // Connect to the background service worker which owns the WebSockets.
+  // The background SW is an extension context and is not subject to PNA.
+  const port = chrome.runtime.connect({ name: 'pplx-recorder' });
 
-  function connectActions(): void {
-    const ws = new WebSocket(RELAY_ACTIONS);
-    ws.onmessage = ({ data }: MessageEvent<string>) => {
-      try { executeAction(JSON.parse(data) as ActionFrame); }
+  // Receive action frames forwarded from the relay via the background SW
+  port.onMessage.addListener((msg: { type: string; data: string }) => {
+    if (msg.type === 'action') {
+      try { executeAction(JSON.parse(msg.data) as ActionFrame); }
       catch (e) { console.error('[pplx-bridge] bad action frame:', e); }
-    };
-    ws.onclose = () => { console.warn('[pplx-bridge] actions closed — reconnecting'); setTimeout(connectActions, 2000); };
-    ws.onerror = () => ws.close();
-  }
+    }
+  });
 
-  connectIngest();
-  connectActions();
+  port.onDisconnect.addListener(() => {
+    console.warn('[pplx-bridge] background port disconnected — reloading recorder in 2s');
+    setTimeout(startRecorder, 2000);
+  });
+
+  // Start rrweb recording; emit each event through the port to the background SW
+  const stop = record({
+    emit(event) {
+      port.postMessage({ type: 'rrweb', data: JSON.stringify(event) });
+    },
+    inlineStylesheet: true,
+    collectFonts:     true,
+    recordShadowDOM:  true,
+    recordCanvas:     false,   // disabled: causes makeProxy crash on screen.height in MV3
+    inlineImages:     false,
+    slimDOMOptions: {
+      script: true, comment: true, headFavicon: true, headWhitespace: true,
+      headMetaSocial: true, headMetaRobots: true, headMetaHttpEquiv: true, headMetaVerification: true,
+    },
+  });
+
+  rrwebMirror = (record as unknown as { mirror: Mirror }).mirror;
+
+  console.log('[pplx-bridge] recorder started → events piped via background SW');
+
+  // Clean up rrweb when the port dies
+  port.onDisconnect.addListener(() => stop?.());
 }
 
 startRecorder();

@@ -23,7 +23,6 @@
   </style>
 </head>
 <body>
-  <!-- Comet site-access warning (shown if assistant appears blocked) -->
   <div id="comet-hint">
     ⚠️ Comet Assistant may not have access to this page.<br>
     Go to <strong>Comet → Settings → Assistant → Site access</strong>
@@ -35,6 +34,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   <script>
+    const PORT      = 7001; // must match relay PORT
     const status    = document.getElementById('status');
     const stage     = document.getElementById('stage');
     const cometHint = document.getElementById('comet-hint');
@@ -43,37 +43,26 @@
     let ready    = false;
     let mirror   = null;
 
-    // ── Comet site-access check ───────────────────────────────────────────────
-    // After 3 seconds, if window.__cometReady is never set by Comet's injected
-    // script, surface the hint banner. Comet sets this flag when it has full
-    // access to the page; absence suggests the domain is restricted.
     setTimeout(() => {
-      if (!window.__cometReady && ready) {
-        cometHint.style.display = 'block';
-      }
+      if (!window.__cometReady && ready) cometHint.style.display = 'block';
     }, 3000);
 
-    // ── Action back-channel ───────────────────────────────────────────────────
-    const actWs = new WebSocket('ws://localhost:7000/actions');
+    const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
     function sendAction(frame) {
       if (actWs.readyState === WebSocket.OPEN) actWs.send(JSON.stringify(frame));
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
     function stableAttrs(el) {
       return {
         testId:    el.dataset?.testid                  ?? null,
         ariaLabel: el.getAttribute?.('aria-label')     ?? null,
         role:      el.getAttribute?.('role')            ?? null,
-        // Include trimmed visible text (max 60 chars) for role+text fallback
         text:      (el.textContent?.trim() ?? '').slice(0, 60) || null,
       };
     }
 
-    // Walk up to the nearest node with a valid rrweb id.
-    // pplx.ai wraps many targets in React portals with deeply nested spans.
     function nearestId(el) {
       let node = el;
       while (node && node !== document.documentElement) {
@@ -84,66 +73,43 @@
       return null;
     }
 
-    // ── Event interceptors ────────────────────────────────────────────────────
     function attachInterceptors(doc) {
-
-      // CLICK
       doc.addEventListener('click', (e) => {
         const hit = nearestId(e.target);
         if (!hit) return;
         const rect = hit.node.getBoundingClientRect();
-        sendAction({
-          type: 'click',
-          id:   hit.id,
-          offsetX: e.clientX - rect.left,
-          offsetY: e.clientY - rect.top,
-          ...stableAttrs(hit.node),
-        });
-        e.preventDefault();
-        e.stopPropagation();
+        sendAction({ type: 'click', id: hit.id,
+          offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top,
+          ...stableAttrs(hit.node) });
+        e.preventDefault(); e.stopPropagation();
       }, true);
 
-      // INPUT
       doc.addEventListener('input', (e) => {
         const hit = nearestId(e.target);
         if (!hit) return;
         sendAction({ type: 'input', id: hit.id, value: e.target.value ?? '' });
       }, true);
 
-      // KEYDOWN — control keys only (Enter, Escape, Tab, arrow keys, shortcuts)
       doc.addEventListener('keydown', (e) => {
-        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return; // regular typing handled by input
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
         const hit = nearestId(e.target);
         if (!hit) return;
-        sendAction({
-          type: 'keydown', id: hit.id,
-          key:  e.key,  code: e.code,
-          shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey,
-        });
+        sendAction({ type: 'keydown', id: hit.id, key: e.key, code: e.code,
+          shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey });
         e.preventDefault();
       }, true);
 
-      // SCROLL — M4: forward all scroll events so pplx.ai's virtualized
-      // thread list loads new messages when Comet scrolls
       doc.addEventListener('scroll', (e) => {
-        const el  = e.target;
+        const el = e.target;
         const hit = nearestId(el);
         if (!hit) return;
         sendAction({ type: 'scroll', id: hit.id, x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
       }, true);
     }
 
-    // ── Replayer init ─────────────────────────────────────────────────────────
     function initReplayer() {
-      replayer = new rrweb.Replayer([], {
-        liveMode: true,
-        root: stage,
-        UNSAFE_replayCanvas: true,
-      });
-
+      replayer = new rrweb.Replayer([], { liveMode: true, root: stage, UNSAFE_replayCanvas: true });
       replayer.startLive();
-
-      // iframe-loaded fires each time the inner document is (re)created
       replayer.on('iframe-loaded', () => {
         const doc = replayer.iframe.contentDocument;
         if (!doc) return;
@@ -152,38 +118,23 @@
       });
     }
 
-    // ── rrweb event stream — M4: rAF-batched drain ───────────────────────────
-    // Batching prevents the replayer being called 20+ times per frame during
-    // heavy pplx.ai streaming, which would cause Comet to scan a moving DOM.
     const eventQueue = [];
     let draining = false;
-
     function drain() {
       const batch = eventQueue.splice(0);
       for (const evt of batch) replayer.addEvent(evt);
       draining = false;
     }
 
-    const evtWs = new WebSocket('ws://localhost:7000/subscribe');
-
+    const evtWs = new WebSocket(`ws://localhost:${PORT}/subscribe`);
     evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
     evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
     evtWs.onerror = () => { status.textContent = '⚠ relay error — is the relay running?'; };
-
     evtWs.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
-
-      if (!ready) {
-        initReplayer();
-        ready = true;
-        status.textContent = '● live';
-      }
-
+      if (!ready) { initReplayer(); ready = true; status.textContent = '● live'; }
       eventQueue.push(event);
-      if (!draining) {
-        draining = true;
-        requestAnimationFrame(drain);
-      }
+      if (!draining) { draining = true; requestAnimationFrame(drain); }
     };
   </script>
 </body>

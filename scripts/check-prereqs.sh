@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Run before pnpm start to catch common setup mistakes
 set -euo pipefail
 
 OK=true
@@ -22,6 +21,7 @@ check "pnpm installed"   "pnpm --version"
 check "Extension built"  "test -f packages/extension/dist/recorder.js"
 check "Relay built"      "test -f packages/relay/dist/index.js"
 check "viewer HTML"      "test -f packages/relay/dist/public/live.html"
+check "Port 7001 free"   "! lsof -ti :7001 > /dev/null 2>&1"
 
 if [[ "$(uname)" == "Darwin" ]]; then
   check "Chrome (macOS)" "test -f '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'"

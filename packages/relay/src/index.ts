@@ -5,7 +5,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PORT ?? 7000);
+
+// macOS uses port 7000 for AirPlay Receiver — default to 7001
+const PORT = Number(process.env.PORT ?? 7001);
 
 const app = express();
 const server = createServer(app);
@@ -18,8 +20,6 @@ app.get('/live', (_req, res) => {
 });
 
 // ── Asset proxy ───────────────────────────────────────────────────────────────
-// Forwards requests to original origin so cross-origin resources resolve
-// inside the viewer iframe without CSP / CORS errors.
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -35,7 +35,6 @@ app.get('/assets/*', async (req, res) => {
     });
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('content-type', ct);
-    // Strip security headers that would block the viewer from rendering assets
     res.removeHeader('content-security-policy');
     res.removeHeader('x-frame-options');
     res.removeHeader('cross-origin-resource-policy');
@@ -47,45 +46,33 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health check (useful for CI / prereq script) ──────────────────────────────
+// ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, port: PORT }));
 
 // ── WebSocket channels ────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
-const recorders = new Set<WebSocket>(); // Chrome extension ingest
-const viewers   = new Set<WebSocket>(); // Comet viewer tabs
+const recorders = new Set<WebSocket>();
+const viewers   = new Set<WebSocket>();
 
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
-  // 1. /ingest — recorder → relay: rrweb event stream in
   if (url === '/ingest') {
     recorders.add(ws);
     console.log(`[relay] ▲ recorder connected   (total: ${recorders.size})`);
-
     ws.on('message', (data) => {
       for (const v of viewers) {
         if (v.readyState === WebSocket.OPEN) v.send(data);
       }
     });
+    ws.on('close', () => { recorders.delete(ws); console.log('[relay] ▼ recorder disconnected'); });
 
-    ws.on('close', () => {
-      recorders.delete(ws);
-      console.log('[relay] ▼ recorder disconnected');
-    });
-
-  // 2. /subscribe — viewer → relay: receives rrweb events
   } else if (url === '/subscribe') {
     viewers.add(ws);
     console.log(`[relay] ▲ viewer connected     (total: ${viewers.size})`);
+    ws.on('close', () => { viewers.delete(ws); console.log('[relay] ▼ viewer disconnected'); });
 
-    ws.on('close', () => {
-      viewers.delete(ws);
-      console.log('[relay] ▼ viewer disconnected');
-    });
-
-  // 3. /actions — viewer → relay → recorder: action back-channel
   } else if (url === '/actions') {
     ws.on('message', (data) => {
       for (const r of recorders) {

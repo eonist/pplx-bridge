@@ -5,7 +5,7 @@
   "description": "Streams perplexity.ai as JPEG frames to local relay. Part of pplx-bridge.",
   "permissions": ["tabs", "activeTab", "scripting", "storage"],
   "host_permissions": [
-    "*://*.perplexity.ai/*",
+    "<all_urls>",
     "http://localhost/*",
     "ws://localhost/*"
   ],

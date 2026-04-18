@@ -1,12 +1,13 @@
 // src/background.ts — service worker
 const RELAY   = 'ws://localhost:7001';
-const FPS     = 8;
+const FPS     = 4;           // 4 fps stays well under Chrome's capture quota
 const QUALITY = 0.6;
 const SCROLL_MULTIPLIER = 12;
 
 let capturing   = false;
 let intervalId  = 0;
 let keepAliveId = 0;
+let capturing_frame = false; // busy-guard: skip if previous capture still in flight
 let streamWs: WebSocket | null = null;
 let actWs:    WebSocket | null = null;
 
@@ -19,7 +20,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   capturing = true;
   console.log('[bg] starting capture for tab', tabId);
 
-  // ── 1. Keep-alive first (before any async that could idle the SW) ────────
+  // ── 1. Keep-alive first ──────────────────────────────────────────────────
   keepAliveId = setInterval(() => {
     chrome.runtime.getPlatformInfo(() => { /* keep SW alive */ });
   }, 20_000) as unknown as number;
@@ -63,6 +64,8 @@ chrome.action.onClicked.addListener(async (tab) => {
   // ── 4. Frame loop ─────────────────────────────────────────────────────────
   intervalId = setInterval(async () => {
     if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
+    if (capturing_frame) return; // skip if last capture still pending
+    capturing_frame = true;
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
         format:  'jpeg',
@@ -71,12 +74,15 @@ chrome.action.onClicked.addListener(async (tab) => {
       if (streamWs.readyState === WebSocket.OPEN) streamWs.send(dataUrlToBuffer(dataUrl));
     } catch (err) {
       console.warn('[bg] captureVisibleTab error:', err);
+    } finally {
+      capturing_frame = false;
     }
   }, Math.round(1000 / FPS)) as unknown as number;
 });
 
 function stopCapture() {
   capturing = false;
+  capturing_frame = false;
   clearInterval(intervalId);
   clearInterval(keepAliveId);
   streamWs?.close();
@@ -99,7 +105,6 @@ function injectAction(action: Record<string, unknown>) {
   const SCROLL_MULTIPLIER = 12;
   const type = action.type as string;
 
-  // Helper: fire the full pointer+mouse sequence React needs
   function fireClick(el: Element, x: number, y: number) {
     const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
     el.dispatchEvent(new PointerEvent('pointerover',  { ...opts, pointerId: 1 }));
@@ -141,7 +146,6 @@ function injectAction(action: Record<string, unknown>) {
     const char = action.value as string;
     const active = document.activeElement as HTMLElement | null;
     if (!active) return 'no active element';
-
     if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
       const proto  = active instanceof HTMLInputElement
         ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
@@ -150,9 +154,7 @@ function injectAction(action: Record<string, unknown>) {
       active.dispatchEvent(new InputEvent('input', { bubbles: true, data: char, inputType: 'insertText' }));
       active.dispatchEvent(new Event('change', { bubbles: true }));
     } else if (active.isContentEditable) {
-      // For React-controlled contentEditable (Perplexity search box)
       active.focus();
-      // Place cursor at end
       const sel = window.getSelection();
       if (sel) {
         const range = document.createRange();
@@ -183,8 +185,9 @@ function injectAction(action: Record<string, unknown>) {
       if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
         el.form?.requestSubmit();
       } else if (el.isContentEditable) {
-        // Perplexity: press Enter via keyboard event on the form submit button
-        const btn = document.querySelector<HTMLButtonElement>('button[type="submit"], button[aria-label*="ubmit"], button[data-testid*="submit"]');
+        const btn = document.querySelector<HTMLButtonElement>(
+          'button[type="submit"], button[aria-label*="ubmit"], button[data-testid*="submit"]'
+        );
         btn?.click();
       }
     }

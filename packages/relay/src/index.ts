@@ -9,10 +9,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // macOS uses port 7000 for AirPlay Receiver — default to 7001
 const PORT = Number(process.env.PORT ?? 7001);
 
-const app = express();
+const app    = express();
 const server = createServer(app);
 
-// ── Static viewer ───────────────────────────────────────────────────────────
+// ── CORS + static viewer ─────────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 
 app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
@@ -24,7 +24,7 @@ app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => res.sendFile(path.join(publicDir, 'live.html')));
 
-// ── Asset proxy ──────────────────────────────────────────────────────────────
+// ── Asset proxy ───────────────────────────────────────────────────────────────
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -43,69 +43,83 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health check ───────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, port: PORT }));
 
 // ── WebSocket channels ────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
-const recorders = new Set<WebSocket>();
-const viewers   = new Set<WebSocket>();
+// /stream  — extension sends binary JPEG frames; viewers receive them
+const streamers     = new Set<WebSocket>(); // extension (sender)
+const streamViewers = new Set<WebSocket>(); // viewer tab (receiver)
 
-// rrweb event type 2 = FullSnapshot
-// We cache the last meta (type 4) + full snapshot (type 2) pair so
-// late-joining viewers get an immediate frame to render.
-const RRWEB_META          = 4;
-const RRWEB_FULL_SNAPSHOT = 2;
-
-let cachedMeta:     string | null = null;
-let cachedSnapshot: string | null = null;
+// /actions — viewer sends action JSON; extension receives it
+const actionReceivers = new Set<WebSocket>(); // extension
 
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
-  if (url === '/ingest') {
-    recorders.add(ws);
-    console.log(`[relay] ▲ recorder connected   (total: ${recorders.size})`);
+  // ── /stream/push — extension pushes JPEG frames ───────────────────────────
+  if (url === '/stream/push') {
+    streamers.add(ws);
+    console.log(`[relay] ▲ streamer connected    (total: ${streamers.size})`);
 
-    ws.on('message', (raw) => {
-      const data = raw instanceof Buffer ? raw.toString() : String(raw);
-
-      // Cache meta + full-snapshot for late joiners
-      try {
-        const evt = JSON.parse(data) as { type: number };
-        if (evt.type === RRWEB_META)          cachedMeta     = data;
-        if (evt.type === RRWEB_FULL_SNAPSHOT) cachedSnapshot = data;
-      } catch (_) {}
-
-      // Broadcast to all live viewers
-      for (const v of viewers) {
-        if (v.readyState === WebSocket.OPEN) v.send(data);
+    ws.on('message', (data, isBinary) => {
+      // Forward raw binary frame to every viewer
+      for (const v of streamViewers) {
+        if (v.readyState === WebSocket.OPEN) v.send(data, { binary: isBinary });
       }
     });
 
     ws.on('close', () => {
-      recorders.delete(ws);
-      console.log('[relay] ▼ recorder disconnected');
+      streamers.delete(ws);
+      console.log('[relay] ▼ streamer disconnected');
     });
 
-  } else if (url === '/subscribe') {
-    viewers.add(ws);
-    console.log(`[relay] ▲ viewer connected     (total: ${viewers.size})`);
-
-    // Immediately send cached snapshot so viewer doesn’t wait for next keystroke
-    if (cachedMeta     && ws.readyState === WebSocket.OPEN) ws.send(cachedMeta);
-    if (cachedSnapshot && ws.readyState === WebSocket.OPEN) ws.send(cachedSnapshot);
+  // ── /stream — viewer receives JPEG frames ─────────────────────────────────
+  } else if (url === '/stream') {
+    streamViewers.add(ws);
+    console.log(`[relay] ▲ stream-viewer connected (total: ${streamViewers.size})`);
 
     ws.on('close', () => {
-      viewers.delete(ws);
-      console.log('[relay] ▼ viewer disconnected');
+      streamViewers.delete(ws);
+      console.log('[relay] ▼ stream-viewer disconnected');
     });
 
+  // ── /actions — bidirectional action channel ───────────────────────────────
+  // Viewer sends actions → relay logs + forwards to extension.
+  // Extension connects here to receive actions.
   } else if (url === '/actions') {
-    ws.on('message', (data) => {
-      for (const r of recorders) {
-        if (r.readyState === WebSocket.OPEN) r.send(data);
+    // Distinguish sender (viewer) from receiver (extension) by who sends first.
+    // We use a simple heuristic: extension registers itself by sending
+    // JSON { "register": "extension" } on connect. Everyone else is a viewer.
+    let isExtension = false;
+
+    ws.on('message', (raw) => {
+      let parsed: Record<string, unknown> | null = null;
+      try { parsed = JSON.parse(raw instanceof Buffer ? raw.toString() : String(raw)); } catch (_) {}
+
+      // Extension registration handshake
+      if (parsed?.register === 'extension') {
+        isExtension = true;
+        actionReceivers.add(ws);
+        console.log(`[relay] ▲ action-receiver (ext) connected (total: ${actionReceivers.size})`);
+        return;
+      }
+
+      if (!isExtension) {
+        // Message from viewer → log and forward to all extension receivers
+        console.log('[relay] action →', JSON.stringify(parsed ?? raw.toString()).slice(0, 120));
+        for (const r of actionReceivers) {
+          if (r.readyState === WebSocket.OPEN) r.send(raw);
+        }
+      }
+    });
+
+    ws.on('close', () => {
+      if (isExtension) {
+        actionReceivers.delete(ws);
+        console.log('[relay] ▼ action-receiver (ext) disconnected');
       }
     });
   }
@@ -116,11 +130,11 @@ server.listen(PORT, () => {
   console.log(`\n╔${'═'.repeat(w)}╗`);
   console.log(`║  pplx-bridge relay  →  localhost:${PORT}${' '.repeat(w - 28 - String(PORT).length)}║`);
   console.log(`╚${'═'.repeat(w)}╝`);
-  console.log(`  Ingest      ws://localhost:${PORT}/ingest`);
-  console.log(`  Subscribe   ws://localhost:${PORT}/subscribe`);
-  console.log(`  Actions     ws://localhost:${PORT}/actions`);
-  console.log(`  Viewer      http://localhost:${PORT}/live`);
-  console.log(`  Health      http://localhost:${PORT}/health\n`);
+  console.log(`  Stream push  ws://localhost:${PORT}/stream/push`);
+  console.log(`  Stream view  ws://localhost:${PORT}/stream`);
+  console.log(`  Actions      ws://localhost:${PORT}/actions`);
+  console.log(`  Viewer       http://localhost:${PORT}/live`);
+  console.log(`  Health       http://localhost:${PORT}/health\n`);
   console.log(`  ⚠️  Comet → Settings → Assistant → Site access`);
   console.log(`     set localhost → Full access\n`);
 });

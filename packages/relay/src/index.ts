@@ -1,5 +1,5 @@
 import express from 'express';
-import { createServer } from 'http';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -12,8 +12,43 @@ const PORT = Number(process.env.PORT ?? 7001);
 const app = express();
 const server = createServer(app);
 
+// ── Private Network Access (PNA) — Chrome blocks ws://localhost from public origins
+//    unless the server echoes back Access-Control-Allow-Private-Network: true
+//    https://developer.chrome.com/blog/private-network-access-update
+server.on('upgrade', (req: IncomingMessage, socket, head) => {
+  // The WebSocketServer handles the actual upgrade; we only need to inject
+  // the PNA header during the HTTP 101 handshake.  ws exposes this via
+  // the 'headers' event on each socket after the handshake object is built,
+  // but the simplest reliable approach is to patch handleProtocols / the
+  // verifyClient option on the WSS.  Instead we intercept at the http server
+  // level by monkey-patching socket.write for the duration of the upgrade.
+  const _write = socket.write.bind(socket);
+  (socket as NodeJS.WritableStream & { write: typeof _write }).write = (
+    chunk: string | Uint8Array,
+    ...args: unknown[]
+  ): boolean => {
+    if (typeof chunk === 'string' && chunk.startsWith('HTTP/1.1 101')) {
+      chunk = chunk.replace(
+        '\r\n\r\n',
+        '\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\n\r\n',
+      );
+    }
+    // @ts-ignore
+    return _write(chunk, ...args);
+  };
+});
+
 // ── Static viewer ─────────────────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
+
+// CORS + PNA for all HTTP responses (preflight OPTIONS for WS pre-flight)
+app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => {
   res.sendFile(path.join(publicDir, 'live.html'));

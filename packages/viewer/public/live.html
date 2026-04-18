@@ -13,40 +13,23 @@
       background: rgba(0,0,0,.6); padding: 3px 8px;
       border-radius: 4px; z-index: 99999; pointer-events: none;
     }
-    #comet-hint {
-      display: none;
-      position: fixed; top: 0; left: 0; right: 0;
-      background: #b45309; color: #fff;
-      font: 13px/1.5 sans-serif; padding: 10px 16px;
-      z-index: 99999;
-    }
   </style>
 </head>
 <body>
-  <div id="comet-hint">
-    ⚠️ Comet Assistant may not have access to this page.<br>
-    Go to <strong>Comet → Settings → Assistant → Site access</strong>
-    and set <code>localhost</code> to <strong>Full access</strong>, then reload.
-  </div>
-
   <div id="stage"></div>
   <div id="status">connecting…</div>
 
   <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   <script>
-    const PORT      = 7001; // must match relay PORT
-    const status    = document.getElementById('status');
-    const stage     = document.getElementById('stage');
-    const cometHint = document.getElementById('comet-hint');
+    const PORT   = 7001;
+    const status = document.getElementById('status');
+    const stage  = document.getElementById('stage');
 
     let replayer = null;
-    let ready    = false;
     let mirror   = null;
+    let ready    = false;
 
-    setTimeout(() => {
-      if (!window.__cometReady && ready) cometHint.style.display = 'block';
-    }, 3000);
-
+    // ── Actions channel (viewer → relay → recorder) ──────────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -56,9 +39,9 @@
 
     function stableAttrs(el) {
       return {
-        testId:    el.dataset?.testid                  ?? null,
-        ariaLabel: el.getAttribute?.('aria-label')     ?? null,
-        role:      el.getAttribute?.('role')            ?? null,
+        testId:    el.dataset?.testid              ?? null,
+        ariaLabel: el.getAttribute('aria-label')   ?? null,
+        role:      el.getAttribute('role')          ?? null,
         text:      (el.textContent?.trim() ?? '').slice(0, 60) || null,
       };
     }
@@ -107,32 +90,77 @@
       }, true);
     }
 
-    function initReplayer() {
-      replayer = new rrweb.Replayer([], { liveMode: true, root: stage, UNSAFE_replayCanvas: true });
-      replayer.startLive();
+    // ── Replayer ──────────────────────────────────────────────────────────────
+    function initReplayer(firstEvent) {
+      // Re-timestamp the first event to "now" so liveMode doesn’t treat it
+      // as ancient history and refuse to render it.
+      const now = Date.now();
+      const offset = now - firstEvent.timestamp;
+      firstEvent.timestamp = now;
+
+      replayer = new rrweb.Replayer([firstEvent], {
+        liveMode: true,
+        root: stage,
+        UNSAFE_replayCanvas: false,
+      });
+
       replayer.on('iframe-loaded', () => {
-        const doc = replayer.iframe.contentDocument;
+        const doc = replayer.iframe?.contentDocument;
         if (!doc) return;
         mirror = replayer.getMirror();
         attachInterceptors(doc);
       });
+
+      replayer.startLive(now);
+
+      // Expose offset so subsequent events can be re-stamped too
+      replayer.__tsOffset = offset;
     }
 
     const eventQueue = [];
     let draining = false;
+
     function drain() {
+      if (!replayer) { draining = false; return; }
       const batch = eventQueue.splice(0);
-      for (const evt of batch) replayer.addEvent(evt);
+      for (const evt of batch) {
+        // Re-timestamp incoming events by the same offset applied to the snapshot
+        evt.timestamp += (replayer.__tsOffset ?? 0);
+        replayer.addEvent(evt);
+      }
       draining = false;
     }
 
+    // ── Subscribe channel (relay → viewer) ───────────────────────────────────
     const evtWs = new WebSocket(`ws://localhost:${PORT}/subscribe`);
     evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
     evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
     evtWs.onerror = () => { status.textContent = '⚠ relay error — is the relay running?'; };
+
     evtWs.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
-      if (!ready) { initReplayer(); ready = true; status.textContent = '● live'; }
+
+      if (!ready) {
+        // First event must be Meta (4) or FullSnapshot (2).
+        // Skip anything else until we get one.
+        if (event.type !== 2 && event.type !== 4) return;
+        if (event.type === 4) {
+          // Meta event — queue it, wait for the FullSnapshot next
+          eventQueue.push(event);
+          return;
+        }
+        // FullSnapshot — now we can boot the replayer
+        // Flush any queued meta first with matching re-timestamp
+        const now = Date.now();
+        for (const e of eventQueue) e.timestamp = now - 1;
+        eventQueue.length = 0;
+
+        initReplayer(event);
+        ready = true;
+        status.textContent = '● live';
+        return;
+      }
+
       eventQueue.push(event);
       if (!draining) { draining = true; requestAnimationFrame(drain); }
     };

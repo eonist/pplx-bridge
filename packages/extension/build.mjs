@@ -9,7 +9,7 @@ const out = resolve(__dirname, 'dist');
 
 mkdirSync(out, { recursive: true });
 
-// Bundle background service worker (handles capture + action injection)
+// Bundle background service worker (CDP + capture)
 await build({
   entryPoints: ['src/background.ts'],
   bundle: true,
@@ -21,7 +21,20 @@ await build({
   minify: false,
 });
 
+// Bundle offscreen document (persistent WebSocket host)
+await build({
+  entryPoints: ['src/offscreen.ts'],
+  bundle: true,
+  outfile: 'dist/offscreen.js',
+  format: 'esm',
+  platform: 'browser',
+  target: ['chrome120'],
+  sourcemap: false,
+  minify: false,
+});
+
 // Copy static files
 cpSync('src/manifest.json', 'dist/manifest.json');
+cpSync('src/offscreen.html', 'dist/offscreen.html');
 
 console.log('[extension] build complete → dist/');

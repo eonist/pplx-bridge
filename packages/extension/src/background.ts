@@ -1,15 +1,11 @@
-// src/background.ts — service worker
-const RELAY   = 'ws://localhost:7001';
+// src/background.ts — service worker (CDP only; WebSockets live in offscreen.ts)
 const FPS     = 4;
 const QUALITY = 0.6;
 
 let capturing       = false;
 let intervalId      = 0;
-let keepAliveId     = 0;
 let capturing_frame = false;
-let streamWs: WebSocket | null = null;
-let actWs:    WebSocket | null = null;
-let debugTabId: number | null  = null;
+let debugTabId: number | null = null;
 
 // ── CDP via chrome.debugger ───────────────────────────────────────────────────
 async function cdpAttach(tabId: number) {
@@ -30,12 +26,12 @@ function cdpSend(method: string, params: Record<string, unknown> = {}): Promise<
   return chrome.debugger.sendCommand({ tabId: debugTabId }, method, params);
 }
 
-// Convert normalised 0-1 coords → real pixels using tab dimensions
+// Convert normalised 0-1 coords to real viewport pixels via CDP Page.getLayoutMetrics
 async function resolveCoords(nx: number, ny: number): Promise<{ x: number; y: number }> {
-  if (debugTabId === null) return { x: nx, y: ny };
-  const tab = await chrome.tabs.get(debugTabId);
-  const w = tab.width  ?? 1280;
-  const h = tab.height ?? 800;
+  const layout = await cdpSend('Page.getLayoutMetrics') as Record<string, Record<string, number>>;
+  const vp = layout.cssVisualViewport ?? layout.cssLayoutViewport;
+  const w = vp?.clientWidth  ?? 1280;
+  const h = vp?.clientHeight ?? 800;
   return { x: Math.round(nx * w), y: Math.round(ny * h) };
 }
 
@@ -64,12 +60,13 @@ async function handleAction(action: Record<string, unknown>) {
   }
 
   if (type === 'keydown') {
-    const key     = action.key     as string;
-    const code    = action.code    as string;
-    const shift   = (action.shiftKey as boolean) ?? false;
-    const ctrl    = (action.ctrlKey  as boolean) ?? false;
-    const meta    = (action.metaKey  as boolean) ?? false;
-    // CDP modifiers bitmask: Alt=1 Ctrl=2 Meta=4 Shift=8
+    const key = action.key as string;
+    // Skip bare modifier keys — CDP rejects them and crashes the SW
+    if (['Meta', 'Shift', 'Control', 'Alt'].includes(key)) return;
+    const code      = action.code     as string;
+    const shift     = (action.shiftKey as boolean) ?? false;
+    const ctrl      = (action.ctrlKey  as boolean) ?? false;
+    const meta      = (action.metaKey  as boolean) ?? false;
     const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
     await cdpSend('Input.dispatchKeyEvent', { type: 'keyDown', key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
     await cdpSend('Input.dispatchKeyEvent', { type: 'keyUp',   key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
@@ -85,6 +82,19 @@ async function handleAction(action: Record<string, unknown>) {
   }
 }
 
+// ── Message listener: actions from offscreen, frames outbound ─────────────────
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === 'action') {
+    let action: Record<string, unknown>;
+    try { action = JSON.parse(msg.payload as string); } catch { sendResponse({ ok: false }); return; }
+    if (action.type !== 'mousemove') console.log('[bg] action:', action.type, action);
+    handleAction(action)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => { console.error('[bg] handleAction error:', err); sendResponse({ ok: false }); });
+    return true; // keep channel open for async response
+  }
+});
+
 // ── Main click handler ────────────────────────────────────────────────────────
 chrome.action.onClicked.addListener(async (tab) => {
   if (capturing) { stopCapture(); return; }
@@ -95,12 +105,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   capturing = true;
   console.log('[bg] starting capture for tab', tabId);
 
-  // 1. Keep-alive
-  keepAliveId = setInterval(() => {
-    chrome.runtime.getPlatformInfo(() => {});
-  }, 20_000) as unknown as number;
-
-  // 2. Attach debugger (trusted input)
+  // 1. Attach debugger
   try {
     await cdpAttach(tabId);
   } catch (err) {
@@ -109,39 +114,24 @@ chrome.action.onClicked.addListener(async (tab) => {
     return;
   }
 
-  // 3. Actions WS
-  actWs = new WebSocket(`${RELAY}/actions`);
-  await new Promise<void>((resolve) => {
-    actWs!.onopen = () => {
-      actWs!.send(JSON.stringify({ register: 'extension' }));
-      console.log('[bg] actions WS connected');
-      resolve();
-    };
-    actWs!.onerror = () => { console.error('[bg] actions WS error'); resolve(); };
-  });
-
-  actWs.onmessage = async (msg) => {
-    let action: Record<string, unknown>;
-    try { action = JSON.parse(msg.data); } catch { return; }
-    if (action.type !== 'mousemove') console.log('[bg] action:', action.type, action);
-    try {
-      await handleAction(action);
-    } catch (err) {
-      console.error('[bg] handleAction error:', err);
+  // 2. Create offscreen document — owns WebSocket connections persistently
+  try {
+    const existing = await (chrome.offscreen as any).hasDocument?.();
+    if (!existing) {
+      await (chrome.offscreen as any).createDocument({
+        url: chrome.runtime.getURL('offscreen.html'),
+        reasons: ['BLOBS'],
+        justification: 'Persistent WebSocket relay bridge for pplx-bridge',
+      });
+      console.log('[bg] offscreen document created');
     }
-  };
-  actWs.onclose = () => console.warn('[bg] actions WS closed');
+  } catch (err) {
+    console.error('[bg] offscreen create failed:', err);
+  }
 
-  // 4. Stream WS
-  streamWs = new WebSocket(`${RELAY}/stream/push`);
-  await new Promise<void>((resolve, reject) => {
-    streamWs!.onopen  = () => { console.log('[bg] stream WS connected'); resolve(); };
-    streamWs!.onerror = () => reject(new Error('stream WS failed'));
-  });
-
-  // 5. Frame loop
+  // 3. Frame capture loop — sends JPEG frames to offscreen for forwarding to relay
   intervalId = setInterval(async () => {
-    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
+    if (!capturing) return;
     if (capturing_frame) return;
     capturing_frame = true;
     try {
@@ -149,7 +139,8 @@ chrome.action.onClicked.addListener(async (tab) => {
         format:  'jpeg',
         quality: Math.round(QUALITY * 100),
       });
-      if (streamWs.readyState === WebSocket.OPEN) streamWs.send(dataUrlToBuffer(dataUrl));
+      chrome.runtime.sendMessage({ type: 'frame', data: dataUrlToBuffer(dataUrl) })
+        .catch(() => {});
     } catch (err) {
       console.warn('[bg] captureVisibleTab error:', err);
     } finally {
@@ -162,12 +153,8 @@ function stopCapture() {
   capturing       = false;
   capturing_frame = false;
   clearInterval(intervalId);
-  clearInterval(keepAliveId);
-  streamWs?.close();
-  actWs?.close();
-  streamWs = null;
-  actWs    = null;
   cdpDetach();
+  (chrome.offscreen as any).closeDocument?.().catch(() => {});
   console.log('[bg] capture stopped');
 }
 

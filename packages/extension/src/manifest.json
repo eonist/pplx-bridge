@@ -3,7 +3,7 @@
   "name": "pplx-bridge recorder",
   "version": "0.2.0",
   "description": "Streams perplexity.ai as JPEG frames to local relay. Part of pplx-bridge.",
-  "permissions": ["tabCapture", "activeTab", "scripting", "storage", "tabs"],
+  "permissions": ["tabs", "activeTab", "scripting", "storage"],
   "host_permissions": [
     "*://*.perplexity.ai/*",
     "http://localhost/*",

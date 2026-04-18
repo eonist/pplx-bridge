@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>pplx-bridge live viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #111; }
+    #stage { width: 100%; height: 100%; }
+    #status {
+      position: fixed; bottom: 8px; right: 12px;
+      font: 11px monospace; color: #aaa; background: rgba(0,0,0,.5);
+      padding: 2px 6px; border-radius: 4px; z-index: 9999;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="status">connecting…</div>
+
+  <!-- rrweb from CDN — swap for local bundle if offline -->
+  <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
+  <script>
+    const status = document.getElementById('status');
+    const stage  = document.getElementById('stage');
+
+    let replayer = null;
+    let started  = false;
+
+    // Action back-channel to relay
+    const actWs = new WebSocket('ws://localhost:7000/actions');
+
+    function initReplayer() {
+      replayer = new rrweb.Replayer([], {
+        liveMode: true,
+        root: stage,
+        UNSAFE_replayCanvas: true,
+      });
+      replayer.startLive();
+
+      // --- Click propagation ---
+      replayer.on('iframe-loaded', () => {
+        const doc = replayer.iframe.contentDocument;
+        if (!doc) return;
+
+        // Intercept clicks inside the replayed iframe
+        doc.addEventListener('click', (e) => {
+          const id = replayer.getMirror().getId(e.target);
+          if (id === -1) return;
+          const rect = e.target.getBoundingClientRect();
+          actWs.send(JSON.stringify({
+            type: 'click',
+            id,
+            offsetX: e.clientX - rect.left,
+            offsetY: e.clientY - rect.top,
+            // Stable fallbacks for stale-id recovery (M4)
+            testId: e.target.dataset?.testid ?? null,
+            ariaLabel: e.target.getAttribute?.('aria-label') ?? null,
+          }));
+          e.preventDefault();
+          e.stopPropagation();
+        }, true);
+
+        // Intercept scroll
+        doc.addEventListener('scroll', (e) => {
+          const el = e.target;
+          const id = replayer.getMirror().getId(el);
+          if (id === -1) return;
+          actWs.send(JSON.stringify({ type: 'scroll', id, x: el.scrollLeft, y: el.scrollTop }));
+        }, true);
+      });
+    }
+
+    // rrweb event stream from relay
+    const evtWs = new WebSocket('ws://localhost:7000/subscribe');
+
+    evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
+    evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
+    evtWs.onerror = () => { status.textContent = 'relay error'; };
+
+    evtWs.onmessage = (msg) => {
+      const event = JSON.parse(msg.data);
+
+      // First event = full snapshot — init the replayer now
+      if (!started) {
+        initReplayer();
+        started = true;
+        status.textContent = 'live ✓';
+      }
+
+      replayer.addEvent(event);
+    };
+  </script>
+</body>
+</html>

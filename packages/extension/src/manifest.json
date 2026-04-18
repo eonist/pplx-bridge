@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "pplx-bridge recorder",
+  "version": "0.1.0",
+  "description": "Streams perplexity.ai DOM to local relay via rrweb",
+  "permissions": ["debugger", "activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "*://*.perplexity.ai/*",
+    "ws://localhost:7000/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://*.perplexity.ai/*"],
+      "js": ["recorder.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["rrweb.min.js"],
+      "matches": ["*://*.perplexity.ai/*"]
+    }
+  ]
+}

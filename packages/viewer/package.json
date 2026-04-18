@@ -1,0 +1,8 @@
+{
+  "name": "@pplx-bridge/viewer",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "cp -r public ../relay/dist/viewer || true",
+    "dev": "echo 'viewer is static — edit public/live.html directly'"
+  }
+}

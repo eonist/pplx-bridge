@@ -1,0 +1,16 @@
+{
+  "name": "@pplx-bridge/extension",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp src/manifest.json dist/manifest.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "dependencies": {
+    "rrweb": "^2.0.0-alpha.13"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^20.12.7"
+  }
+}

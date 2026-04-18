@@ -6,7 +6,7 @@
     "build":  "pnpm -r build",
     "dev":    "pnpm -r --parallel dev",
     "check":  "bash scripts/check-prereqs.sh",
-    "start":  "pnpm build && bash scripts/check-prereqs.sh && concurrently -n relay,chrome -c cyan,yellow \"node packages/relay/dist/index.js\" \"bash scripts/launch-chrome.sh\"",
+    "start":  "pnpm build && node packages/relay/dist/index.js",
     "relay":  "node packages/relay/dist/index.js",
     "chrome": "bash scripts/launch-chrome.sh"
   },

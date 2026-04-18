@@ -55,56 +55,44 @@
       return null;
     }
 
-    // Clicks land on the outer #stage (iframe has pointer-events:none).
-    // Translate outer coords -> iframe-local coords via elementFromPoint.
-    function attachOuterInterceptors() {
-      const iframe = stage.querySelector('iframe');
-
-      stage.setAttribute('tabindex', '0');
-
-      stage.addEventListener('click', (e) => {
-        if (!mirror || !iframe) return;
-        const rect = iframe.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        const doc = iframe.contentDocument;
-        if (!doc) return;
-        const target = doc.elementFromPoint(x, y);
-        if (!target) return;
-        const hit = nearestId(target);
+    function attachInterceptors(doc) {
+      doc.addEventListener('click', (e) => {
+        const hit = nearestId(e.target);
         if (!hit) return;
-        const elRect = hit.node.getBoundingClientRect();
+        const rect = hit.node.getBoundingClientRect();
         sendAction({ type: 'click', id: hit.id,
-          offsetX: x - elRect.left, offsetY: y - elRect.top,
+          offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top,
           ...stableAttrs(hit.node) });
-      });
+        e.preventDefault(); e.stopPropagation();
+      }, true);
 
-      stage.addEventListener('keydown', (e) => {
-        if (!mirror) return;
+      doc.addEventListener('input', (e) => {
+        const hit = nearestId(e.target);
+        if (!hit) return;
+        sendAction({ type: 'input', id: hit.id, value: e.target.value ?? '' });
+      }, true);
+
+      doc.addEventListener('keydown', (e) => {
         if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) return;
-        const doc = iframe?.contentDocument;
-        const target = doc?.activeElement ?? null;
-        const hit = target ? nearestId(target) : null;
-        sendAction({ type: 'keydown', id: hit?.id ?? null, key: e.key, code: e.code,
+        const hit = nearestId(e.target);
+        if (!hit) return;
+        sendAction({ type: 'keydown', id: hit.id, key: e.key, code: e.code,
           shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey });
         e.preventDefault();
-      });
+      }, true);
 
-      stage.addEventListener('input', (e) => {
-        if (!mirror) return;
-        const doc = iframe?.contentDocument;
-        const target = doc?.activeElement ?? null;
-        const hit = target ? nearestId(target) : null;
+      doc.addEventListener('scroll', (e) => {
+        const el = e.target;
+        const hit = nearestId(el);
         if (!hit) return;
-        sendAction({ type: 'input', id: hit.id, value: e.target?.value ?? '' });
-      });
+        sendAction({ type: 'scroll', id: hit.id, x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
+      }, true);
     }
 
     function fixIframePosition() {
       const iframe = stage.querySelector('iframe');
       if (iframe) {
-        // pointer-events:none so clicks fall through to the outer #stage listener
-        iframe.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;pointer-events:none;';
+        iframe.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;border:none;';
       }
     }
 
@@ -120,15 +108,19 @@
       });
 
       replayer.on('iframe-loaded', () => {
+        const doc = replayer.iframe?.contentDocument;
+        if (!doc) return;
         mirror = replayer.getMirror();
+        // Enable pointer events inside the replayer iframe
+        if (typeof replayer.enableInteract === 'function') {
+          replayer.enableInteract();
+        }
+        attachInterceptors(doc);
       });
 
       replayer.startLive(now);
 
-      requestAnimationFrame(() => {
-        fixIframePosition();
-        attachOuterInterceptors();
-      });
+      requestAnimationFrame(fixIframePosition);
 
       replayer.__tsOffset = offset;
     }

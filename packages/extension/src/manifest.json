@@ -6,7 +6,8 @@
   "permissions": ["debugger", "activeTab", "scripting", "storage", "tabs"],
   "host_permissions": [
     "*://*.perplexity.ai/*",
-    "ws://localhost:7001/*"
+    "http://localhost/*",
+    "ws://localhost/*"
   ],
   "content_scripts": [
     {

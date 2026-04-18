@@ -106,7 +106,7 @@ function startRecorder(): void {
         inlineStylesheet: true,
         collectFonts:     true,
         recordShadowDOM:  true,
-        recordCanvas:     true,
+        recordCanvas:     false,   // disabled: causes makeProxy crash on screen.height in MV3
         inlineImages:     false,
         slimDOMOptions: {
           script: true, comment: true, headFavicon: true, headWhitespace: true,

@@ -1,16 +1,91 @@
 // src/background.ts — service worker
 const RELAY   = 'ws://localhost:7001';
-const FPS     = 4;           // 4 fps stays well under Chrome's capture quota
+const FPS     = 4;
 const QUALITY = 0.6;
-const SCROLL_MULTIPLIER = 12;
 
-let capturing   = false;
-let intervalId  = 0;
-let keepAliveId = 0;
-let capturing_frame = false; // busy-guard: skip if previous capture still in flight
+let capturing       = false;
+let intervalId      = 0;
+let keepAliveId     = 0;
+let capturing_frame = false;
 let streamWs: WebSocket | null = null;
 let actWs:    WebSocket | null = null;
+let debugTabId: number | null  = null;
 
+// ── CDP via chrome.debugger ───────────────────────────────────────────────────
+async function cdpAttach(tabId: number) {
+  await chrome.debugger.attach({ tabId }, '1.3');
+  debugTabId = tabId;
+  console.log('[bg] debugger attached to tab', tabId);
+}
+
+async function cdpDetach() {
+  if (debugTabId === null) return;
+  try { await chrome.debugger.detach({ tabId: debugTabId }); } catch {}
+  console.log('[bg] debugger detached from tab', debugTabId);
+  debugTabId = null;
+}
+
+function cdpSend(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  if (debugTabId === null) return Promise.reject(new Error('debugger not attached'));
+  return chrome.debugger.sendCommand({ tabId: debugTabId }, method, params);
+}
+
+// Convert normalised 0-1 coords → real pixels using tab dimensions
+async function resolveCoords(nx: number, ny: number): Promise<{ x: number; y: number }> {
+  if (debugTabId === null) return { x: nx, y: ny };
+  const tab = await chrome.tabs.get(debugTabId);
+  const w = tab.width  ?? 1280;
+  const h = tab.height ?? 800;
+  return { x: Math.round(nx * w), y: Math.round(ny * h) };
+}
+
+// ── Action handler ────────────────────────────────────────────────────────────
+async function handleAction(action: Record<string, unknown>) {
+  const type = action.type as string;
+
+  if (type === 'mousemove') {
+    const { x, y } = await resolveCoords(action.x as number, action.y as number);
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    return;
+  }
+
+  if (type === 'click') {
+    const { x, y } = await resolveCoords(action.x as number, action.y as number);
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
+    console.log('[bg] CDP click at', x, y);
+    return;
+  }
+
+  if (type === 'type') {
+    const text = action.value as string;
+    await cdpSend('Input.insertText', { text });
+    return;
+  }
+
+  if (type === 'keydown') {
+    const key     = action.key     as string;
+    const code    = action.code    as string;
+    const shift   = (action.shiftKey as boolean) ?? false;
+    const ctrl    = (action.ctrlKey  as boolean) ?? false;
+    const meta    = (action.metaKey  as boolean) ?? false;
+    // CDP modifiers bitmask: Alt=1 Ctrl=2 Meta=4 Shift=8
+    const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
+    await cdpSend('Input.dispatchKeyEvent', { type: 'keyDown', key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
+    await cdpSend('Input.dispatchKeyEvent', { type: 'keyUp',   key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
+    return;
+  }
+
+  if (type === 'scroll') {
+    const { x, y } = await resolveCoords(0.5, 0.5);
+    const deltaX = (action.x as number) * 120;
+    const deltaY = (action.y as number) * 120;
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX, deltaY });
+    return;
+  }
+}
+
+// ── Main click handler ────────────────────────────────────────────────────────
 chrome.action.onClicked.addListener(async (tab) => {
   if (capturing) { stopCapture(); return; }
   if (!tab.id || !tab.windowId) return;
@@ -20,12 +95,21 @@ chrome.action.onClicked.addListener(async (tab) => {
   capturing = true;
   console.log('[bg] starting capture for tab', tabId);
 
-  // ── 1. Keep-alive first ──────────────────────────────────────────────────
+  // 1. Keep-alive
   keepAliveId = setInterval(() => {
-    chrome.runtime.getPlatformInfo(() => { /* keep SW alive */ });
+    chrome.runtime.getPlatformInfo(() => {});
   }, 20_000) as unknown as number;
 
-  // ── 2. Actions WS ────────────────────────────────────────────────────────
+  // 2. Attach debugger (trusted input)
+  try {
+    await cdpAttach(tabId);
+  } catch (err) {
+    console.error('[bg] debugger attach failed:', err);
+    stopCapture();
+    return;
+  }
+
+  // 3. Actions WS
   actWs = new WebSocket(`${RELAY}/actions`);
   await new Promise<void>((resolve) => {
     actWs!.onopen = () => {
@@ -41,30 +125,24 @@ chrome.action.onClicked.addListener(async (tab) => {
     try { action = JSON.parse(msg.data); } catch { return; }
     if (action.type !== 'mousemove') console.log('[bg] action:', action.type, action);
     try {
-      const result = await chrome.scripting.executeScript({
-        target: { tabId },
-        world:  'MAIN',
-        func:   injectAction,
-        args:   [action],
-      });
-      if (action.type === 'click') console.log('[bg] click result:', JSON.stringify(result));
+      await handleAction(action);
     } catch (err) {
-      console.error('[bg] executeScript error:', err);
+      console.error('[bg] handleAction error:', err);
     }
   };
   actWs.onclose = () => console.warn('[bg] actions WS closed');
 
-  // ── 3. Stream WS ─────────────────────────────────────────────────────────
+  // 4. Stream WS
   streamWs = new WebSocket(`${RELAY}/stream/push`);
   await new Promise<void>((resolve, reject) => {
     streamWs!.onopen  = () => { console.log('[bg] stream WS connected'); resolve(); };
     streamWs!.onerror = () => reject(new Error('stream WS failed'));
   });
 
-  // ── 4. Frame loop ─────────────────────────────────────────────────────────
+  // 5. Frame loop
   intervalId = setInterval(async () => {
     if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
-    if (capturing_frame) return; // skip if last capture still pending
+    if (capturing_frame) return;
     capturing_frame = true;
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
@@ -81,7 +159,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 function stopCapture() {
-  capturing = false;
+  capturing       = false;
   capturing_frame = false;
   clearInterval(intervalId);
   clearInterval(keepAliveId);
@@ -89,6 +167,7 @@ function stopCapture() {
   actWs?.close();
   streamWs = null;
   actWs    = null;
+  cdpDetach();
   console.log('[bg] capture stopped');
 }
 
@@ -98,118 +177,4 @@ function dataUrlToBuffer(dataUrl: string): ArrayBuffer {
   const buf    = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
   return buf.buffer;
-}
-
-// ── Injector (runs inside page context via executeScript) ─────────────────
-function injectAction(action: Record<string, unknown>) {
-  const SCROLL_MULTIPLIER = 12;
-  const type = action.type as string;
-
-  function fireClick(el: Element, x: number, y: number) {
-    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-    el.dispatchEvent(new PointerEvent('pointerover',  { ...opts, pointerId: 1 }));
-    el.dispatchEvent(new PointerEvent('pointerenter', { ...opts, pointerId: 1, bubbles: false }));
-    el.dispatchEvent(new MouseEvent('mouseover',  opts));
-    el.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }));
-    el.dispatchEvent(new PointerEvent('pointermove', { ...opts, pointerId: 1 }));
-    el.dispatchEvent(new MouseEvent('mousemove',  opts));
-    el.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1 }));
-    el.dispatchEvent(new MouseEvent('mousedown',  opts));
-    (el as HTMLElement).focus?.();
-    el.dispatchEvent(new PointerEvent('pointerup', { ...opts, pointerId: 1 }));
-    el.dispatchEvent(new MouseEvent('mouseup',   opts));
-    el.dispatchEvent(new MouseEvent('click',     opts));
-  }
-
-  if (type === 'mousemove') {
-    const x  = (action.x as number) * window.innerWidth;
-    const y  = (action.y as number) * window.innerHeight;
-    const el = document.elementFromPoint(x, y);
-    if (el) {
-      const opts = { bubbles: true, clientX: x, clientY: y };
-      el.dispatchEvent(new PointerEvent('pointermove', { ...opts, pointerId: 1 }));
-      el.dispatchEvent(new MouseEvent('mousemove', opts));
-    }
-    return;
-  }
-
-  if (type === 'click') {
-    const x  = (action.x as number) * window.innerWidth;
-    const y  = (action.y as number) * window.innerHeight;
-    const el = document.elementFromPoint(x, y);
-    if (!el) return `no element at (${x.toFixed(0)}, ${y.toFixed(0)})`;
-    fireClick(el, x, y);
-    return `clicked ${el.tagName} #${el.id} .${[...el.classList].join(' ')}`;
-  }
-
-  if (type === 'type') {
-    const char = action.value as string;
-    const active = document.activeElement as HTMLElement | null;
-    if (!active) return 'no active element';
-    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
-      const proto  = active instanceof HTMLInputElement
-        ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      setter?.call(active, active.value + char);
-      active.dispatchEvent(new InputEvent('input', { bubbles: true, data: char, inputType: 'insertText' }));
-      active.dispatchEvent(new Event('change', { bubbles: true }));
-    } else if (active.isContentEditable) {
-      active.focus();
-      const sel = window.getSelection();
-      if (sel) {
-        const range = document.createRange();
-        range.selectNodeContents(active);
-        range.collapse(false);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      }
-      document.execCommand('insertText', false, char);
-    }
-    return;
-  }
-
-  if (type === 'keydown') {
-    const el = document.activeElement as HTMLElement | null;
-    if (!el) return;
-    const init: KeyboardEventInit = {
-      key:      action.key      as string,
-      code:     action.code     as string,
-      shiftKey: (action.shiftKey as boolean) ?? false,
-      ctrlKey:  (action.ctrlKey  as boolean) ?? false,
-      metaKey:  (action.metaKey  as boolean) ?? false,
-      bubbles: true, cancelable: true,
-    };
-    el.dispatchEvent(new KeyboardEvent('keydown', init));
-    el.dispatchEvent(new KeyboardEvent('keyup',   init));
-    if (action.key === 'Enter') {
-      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-        el.form?.requestSubmit();
-      } else if (el.isContentEditable) {
-        const btn = document.querySelector<HTMLButtonElement>(
-          'button[type="submit"], button[aria-label*="ubmit"], button[data-testid*="submit"]'
-        );
-        btn?.click();
-      }
-    }
-    if (action.key === 'Backspace') {
-      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-        const proto  = el instanceof HTMLInputElement
-          ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-        setter?.call(el, el.value.slice(0, -1));
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
-      } else if (el.isContentEditable) {
-        document.execCommand('delete', false);
-      }
-    }
-    return;
-  }
-
-  if (type === 'scroll') {
-    const dx = (action.x as number) * SCROLL_MULTIPLIER;
-    const dy = (action.y as number) * SCROLL_MULTIPLIER;
-    window.scrollBy(dx, dy);
-    const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) as HTMLElement | null;
-    el?.scrollBy?.(dx, dy);
-  }
 }

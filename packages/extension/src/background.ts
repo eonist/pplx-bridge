@@ -1,14 +1,14 @@
-// background.ts — service worker
+// src/background.ts — service worker
 const RELAY   = 'ws://localhost:7001';
 const FPS     = 8;
 const QUALITY = 0.6;
-const SCROLL_MULTIPLIER = 12; // wheel deltaY is tiny — scale up
+const SCROLL_MULTIPLIER = 12;
 
 let capturing   = false;
 let intervalId  = 0;
 let keepAliveId = 0;
 let streamWs: WebSocket | null = null;
-let actWs: WebSocket | null = null;
+let actWs:    WebSocket | null = null;
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (capturing) { stopCapture(); return; }
@@ -19,34 +19,22 @@ chrome.action.onClicked.addListener(async (tab) => {
   capturing = true;
   console.log('[bg] starting capture for tab', tabId);
 
-  // ── 1. Stream WS ──────────────────────────────────────────────────────
-  streamWs = new WebSocket(`${RELAY}/stream/push`);
-  await new Promise<void>((resolve, reject) => {
-    streamWs!.onopen  = () => resolve();
-    streamWs!.onerror = () => reject(new Error('stream WS failed'));
-  });
-  console.log('[bg] stream WS connected');
+  // ── 1. Keep-alive first (before any async that could idle the SW) ────────
+  keepAliveId = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => { /* keep SW alive */ });
+  }, 20_000) as unknown as number;
 
-  // ── 2. Frame loop ─────────────────────────────────────────────────────
-  intervalId = setInterval(async () => {
-    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
-    try {
-      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
-        format: 'jpeg',
-        quality: Math.round(QUALITY * 100),
-      });
-      if (streamWs.readyState === WebSocket.OPEN) streamWs.send(dataUrlToBuffer(dataUrl));
-    } catch (err) {
-      console.warn('[bg] captureVisibleTab error:', err);
-    }
-  }, Math.round(1000 / FPS)) as unknown as number;
-
-  // ── 3. Actions WS ─────────────────────────────────────────────────────
+  // ── 2. Actions WS ────────────────────────────────────────────────────────
   actWs = new WebSocket(`${RELAY}/actions`);
-  actWs.onopen = () => {
-    actWs!.send(JSON.stringify({ register: 'extension' }));
-    console.log('[bg] actions WS connected');
-  };
+  await new Promise<void>((resolve) => {
+    actWs!.onopen = () => {
+      actWs!.send(JSON.stringify({ register: 'extension' }));
+      console.log('[bg] actions WS connected');
+      resolve();
+    };
+    actWs!.onerror = () => { console.error('[bg] actions WS error'); resolve(); };
+  });
+
   actWs.onmessage = async (msg) => {
     let action: Record<string, unknown>;
     try { action = JSON.parse(msg.data); } catch { return; }
@@ -54,22 +42,37 @@ chrome.action.onClicked.addListener(async (tab) => {
     try {
       const result = await chrome.scripting.executeScript({
         target: { tabId },
-        world: 'MAIN',
-        func: injectAction,
-        args: [action],
+        world:  'MAIN',
+        func:   injectAction,
+        args:   [action],
       });
-      if (action.type === 'click') console.log('[bg] executeScript result:', JSON.stringify(result));
+      if (action.type === 'click') console.log('[bg] click result:', JSON.stringify(result));
     } catch (err) {
       console.error('[bg] executeScript error:', err);
     }
   };
-  actWs.onclose = () => { console.warn('[bg] actions WS closed'); };
+  actWs.onclose = () => console.warn('[bg] actions WS closed');
 
-  // ── 4. Keep-alive: chrome.runtime.getPlatformInfo every 20s ───────────
-  // MV3 service workers idle-kill after ~30s; this prevents that.
-  keepAliveId = setInterval(() => {
-    chrome.runtime.getPlatformInfo(() => { /* keep SW alive */ });
-  }, 20_000) as unknown as number;
+  // ── 3. Stream WS ─────────────────────────────────────────────────────────
+  streamWs = new WebSocket(`${RELAY}/stream/push`);
+  await new Promise<void>((resolve, reject) => {
+    streamWs!.onopen  = () => { console.log('[bg] stream WS connected'); resolve(); };
+    streamWs!.onerror = () => reject(new Error('stream WS failed'));
+  });
+
+  // ── 4. Frame loop ─────────────────────────────────────────────────────────
+  intervalId = setInterval(async () => {
+    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) { stopCapture(); return; }
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
+        format:  'jpeg',
+        quality: Math.round(QUALITY * 100),
+      });
+      if (streamWs.readyState === WebSocket.OPEN) streamWs.send(dataUrlToBuffer(dataUrl));
+    } catch (err) {
+      console.warn('[bg] captureVisibleTab error:', err);
+    }
+  }, Math.round(1000 / FPS)) as unknown as number;
 });
 
 function stopCapture() {
@@ -91,40 +94,73 @@ function dataUrlToBuffer(dataUrl: string): ArrayBuffer {
   return buf.buffer;
 }
 
-// ── Injector (runs inside page context via executeScript) ──────────────────
+// ── Injector (runs inside page context via executeScript) ─────────────────
 function injectAction(action: Record<string, unknown>) {
   const SCROLL_MULTIPLIER = 12;
   const type = action.type as string;
 
-  if (type === 'click' || type === 'mousemove') {
+  // Helper: fire the full pointer+mouse sequence React needs
+  function fireClick(el: Element, x: number, y: number) {
+    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
+    el.dispatchEvent(new PointerEvent('pointerover',  { ...opts, pointerId: 1 }));
+    el.dispatchEvent(new PointerEvent('pointerenter', { ...opts, pointerId: 1, bubbles: false }));
+    el.dispatchEvent(new MouseEvent('mouseover',  opts));
+    el.dispatchEvent(new MouseEvent('mouseenter', { ...opts, bubbles: false }));
+    el.dispatchEvent(new PointerEvent('pointermove', { ...opts, pointerId: 1 }));
+    el.dispatchEvent(new MouseEvent('mousemove',  opts));
+    el.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1 }));
+    el.dispatchEvent(new MouseEvent('mousedown',  opts));
+    (el as HTMLElement).focus?.();
+    el.dispatchEvent(new PointerEvent('pointerup', { ...opts, pointerId: 1 }));
+    el.dispatchEvent(new MouseEvent('mouseup',   opts));
+    el.dispatchEvent(new MouseEvent('click',     opts));
+  }
+
+  if (type === 'mousemove') {
     const x  = (action.x as number) * window.innerWidth;
     const y  = (action.y as number) * window.innerHeight;
-    const el = document.elementFromPoint(x, y) as HTMLElement | null;
-    if (!el) return `no element at (${x.toFixed(0)}, ${y.toFixed(0)})`;
-    if (type === 'click') {
-      el.focus();
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      return `clicked ${el.tagName} #${el.id} .${el.className}`;
-    } else {
-      el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
+    const el = document.elementFromPoint(x, y);
+    if (el) {
+      const opts = { bubbles: true, clientX: x, clientY: y };
+      el.dispatchEvent(new PointerEvent('pointermove', { ...opts, pointerId: 1 }));
+      el.dispatchEvent(new MouseEvent('mousemove', opts));
     }
     return;
   }
 
+  if (type === 'click') {
+    const x  = (action.x as number) * window.innerWidth;
+    const y  = (action.y as number) * window.innerHeight;
+    const el = document.elementFromPoint(x, y);
+    if (!el) return `no element at (${x.toFixed(0)}, ${y.toFixed(0)})`;
+    fireClick(el, x, y);
+    return `clicked ${el.tagName} #${el.id} .${[...el.classList].join(' ')}`;
+  }
+
   if (type === 'type') {
     const char = action.value as string;
-    const el   = document.activeElement as HTMLElement | null;
-    if (!el) return 'no active element';
-    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-      const proto  = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+    const active = document.activeElement as HTMLElement | null;
+    if (!active) return 'no active element';
+
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+      const proto  = active instanceof HTMLInputElement
+        ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      // Append character to current value (don't replace)
-      setter?.call(el, el.value + char);
-      el.dispatchEvent(new InputEvent('input',  { bubbles: true, data: char, inputType: 'insertText' }));
-    } else if ((el as HTMLElement).isContentEditable) {
-      el.focus();
+      setter?.call(active, active.value + char);
+      active.dispatchEvent(new InputEvent('input', { bubbles: true, data: char, inputType: 'insertText' }));
+      active.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (active.isContentEditable) {
+      // For React-controlled contentEditable (Perplexity search box)
+      active.focus();
+      // Place cursor at end
+      const sel = window.getSelection();
+      if (sel) {
+        const range = document.createRange();
+        range.selectNodeContents(active);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
       document.execCommand('insertText', false, char);
     }
     return;
@@ -134,7 +170,8 @@ function injectAction(action: Record<string, unknown>) {
     const el = document.activeElement as HTMLElement | null;
     if (!el) return;
     const init: KeyboardEventInit = {
-      key: action.key as string, code: action.code as string,
+      key:      action.key      as string,
+      code:     action.code     as string,
       shiftKey: (action.shiftKey as boolean) ?? false,
       ctrlKey:  (action.ctrlKey  as boolean) ?? false,
       metaKey:  (action.metaKey  as boolean) ?? false,
@@ -142,15 +179,25 @@ function injectAction(action: Record<string, unknown>) {
     };
     el.dispatchEvent(new KeyboardEvent('keydown', init));
     el.dispatchEvent(new KeyboardEvent('keyup',   init));
-    // Handle Enter/Backspace natively on inputs
-    if (action.key === 'Enter' && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-      el.form?.requestSubmit();
+    if (action.key === 'Enter') {
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        el.form?.requestSubmit();
+      } else if (el.isContentEditable) {
+        // Perplexity: press Enter via keyboard event on the form submit button
+        const btn = document.querySelector<HTMLButtonElement>('button[type="submit"], button[aria-label*="ubmit"], button[data-testid*="submit"]');
+        btn?.click();
+      }
     }
-    if (action.key === 'Backspace' && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-      const proto  = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      setter?.call(el, el.value.slice(0, -1));
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+    if (action.key === 'Backspace') {
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+        const proto  = el instanceof HTMLInputElement
+          ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        setter?.call(el, el.value.slice(0, -1));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      } else if (el.isContentEditable) {
+        document.execCommand('delete', false);
+      }
     }
     return;
   }
@@ -159,7 +206,6 @@ function injectAction(action: Record<string, unknown>) {
     const dx = (action.x as number) * SCROLL_MULTIPLIER;
     const dy = (action.y as number) * SCROLL_MULTIPLIER;
     window.scrollBy(dx, dy);
-    // Also try scrolling the element under centre
     const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2) as HTMLElement | null;
     el?.scrollBy?.(dx, dy);
   }

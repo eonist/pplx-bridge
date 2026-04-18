@@ -20,7 +20,6 @@
   <div id="stage"></div>
   <div id="status">connecting…</div>
 
-  <!-- rrweb from CDN — swap for /rrweb.min.js if serving locally -->
   <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
   <script>
     const status = document.getElementById('status');
@@ -28,8 +27,9 @@
 
     let replayer = null;
     let ready    = false;
+    let mirror   = null;
 
-    // Action back-channel → relay → recorder
+    // ── Action back-channel ──────────────────────────────────────────────────
     const actWs = new WebSocket('ws://localhost:7000/actions');
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -39,44 +39,81 @@
       }
     }
 
-    function attachInterceptors() {
-      const doc = replayer.iframe.contentDocument;
-      if (!doc) return;
-      const mirror = replayer.getMirror();
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function stableAttrs(el) {
+      return {
+        testId:    el.dataset?.testid ?? null,
+        ariaLabel: el.getAttribute?.('aria-label') ?? null,
+      };
+    }
 
-      // --- Click propagation ---
+    // Walk up the DOM tree to find the nearest node with a valid rrweb id.
+    // pplx.ai wraps many interactive elements in React portals; the click
+    // target may be a deep text node whose id is -1.
+    function nearestId(el) {
+      let node = el;
+      while (node && node !== document.documentElement) {
+        const id = mirror.getId(node);
+        if (id !== -1) return { id, node };
+        node = node.parentElement;
+      }
+      return null;
+    }
+
+    // ── Event interceptors (attached once iframe doc is ready) ───────────────
+    function attachInterceptors(doc) {
+
+      // CLICK
       doc.addEventListener('click', (e) => {
-        const id = mirror.getId(e.target);
-        if (id === -1) return;
-        const rect = e.target.getBoundingClientRect();
+        const hit = nearestId(e.target);
+        if (!hit) return;
+        const rect = hit.node.getBoundingClientRect();
         sendAction({
           type: 'click',
-          id,
-          offsetX:   e.clientX - rect.left,
-          offsetY:   e.clientY - rect.top,
-          testId:    e.target.dataset?.testid    ?? null,
-          ariaLabel: e.target.getAttribute?.('aria-label') ?? null,
+          id:   hit.id,
+          offsetX: e.clientX - rect.left,
+          offsetY: e.clientY - rect.top,
+          ...stableAttrs(hit.node),
         });
         e.preventDefault();
         e.stopPropagation();
       }, true);
 
-      // --- Input propagation ---
+      // INPUT — forward the full current value so recorder can set it
       doc.addEventListener('input', (e) => {
-        const id = mirror.getId(e.target);
-        if (id === -1) return;
-        sendAction({ type: 'input', id, value: e.target.value ?? '' });
+        const hit = nearestId(e.target);
+        if (!hit) return;
+        sendAction({ type: 'input', id: hit.id, value: e.target.value ?? '' });
       }, true);
 
-      // --- Scroll propagation ---
+      // KEYDOWN — forward Enter / special keys that pplx.ai listens to
+      doc.addEventListener('keydown', (e) => {
+        const hit = nearestId(e.target);
+        if (!hit) return;
+        // Only forward if it's a control key; regular typing is handled by input
+        if (e.key.length === 1) return;
+        sendAction({
+          type: 'keydown',
+          id:   hit.id,
+          key:  e.key,
+          code: e.code,
+          shiftKey: e.shiftKey,
+          ctrlKey:  e.ctrlKey,
+          metaKey:  e.metaKey,
+        });
+        e.preventDefault();
+      }, true);
+
+      // SCROLL
       doc.addEventListener('scroll', (e) => {
-        const el = e.target;
-        const id = mirror.getId(el);
-        if (id === -1) return;
-        sendAction({ type: 'scroll', id, x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
+        const el  = e.target;
+        const hit = nearestId(el);
+        if (!hit) return;
+        sendAction({ type: 'scroll', id: hit.id, x: el.scrollLeft ?? 0, y: el.scrollTop ?? 0 });
       }, true);
     }
 
+    // ── Replayer init ────────────────────────────────────────────────────────
     function initReplayer() {
       replayer = new rrweb.Replayer([], {
         liveMode: true,
@@ -86,16 +123,32 @@
 
       replayer.startLive();
 
-      // Wire interceptors once the iframe document is ready
-      replayer.on('iframe-loaded', attachInterceptors);
+      // iframe-loaded fires each time the inner document is (re)created
+      replayer.on('iframe-loaded', () => {
+        const doc = replayer.iframe.contentDocument;
+        if (!doc) return;
+        mirror = replayer.getMirror();
+        attachInterceptors(doc);
+      });
     }
 
-    // rrweb event stream from relay
+    // ── rrweb event stream from relay ────────────────────────────────────────
     const evtWs = new WebSocket('ws://localhost:7000/subscribe');
 
     evtWs.onopen  = () => { status.textContent = 'connected — waiting for snapshot…'; };
     evtWs.onclose = () => { status.textContent = 'disconnected — reload to reconnect'; };
     evtWs.onerror = () => { status.textContent = '⚠ relay error — is the relay running?'; };
+
+    // Batch incoming messages with rAF to avoid flooding the replayer
+    // during heavy pplx.ai streaming (up to 20 mutations/sec)
+    const eventQueue = [];
+    let draining = false;
+
+    function drain() {
+      const batch = eventQueue.splice(0);
+      for (const evt of batch) replayer.addEvent(evt);
+      draining = false;
+    }
 
     evtWs.onmessage = (msg) => {
       const event = JSON.parse(msg.data);
@@ -103,10 +156,14 @@
       if (!ready) {
         initReplayer();
         ready = true;
-        status.textContent = '● live';
+        status.textContent = '\u25cf live';
       }
 
-      replayer.addEvent(event);
+      eventQueue.push(event);
+      if (!draining) {
+        draining = true;
+        requestAnimationFrame(drain);
+      }
     };
   </script>
 </body>

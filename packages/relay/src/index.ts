@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import express from 'express';
 import { createServer, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -49,9 +50,8 @@ app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPCon
 // ── WebSocket channels ────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
-const streamViewers = new Set<WebSocket>(); // live viewer tabs
+const streamViewers = new Set<WebSocket>();
 
-// Send a JPEG buffer to all connected viewers
 function broadcastFrame(jpeg: Buffer): void {
   const data = jpeg.buffer.slice(jpeg.byteOffset, jpeg.byteOffset + jpeg.byteLength);
   for (const v of streamViewers) {
@@ -60,9 +60,6 @@ function broadcastFrame(jpeg: Buffer): void {
 }
 
 // ── Single-char type coalescing (#45) ────────────────────────────────
-// Comet sends one {type:'type',value:'x'} per character in rapid succession.
-// Buffering them and flushing as one call eliminates 60 serial CDP round-trips
-// for a long string, preventing response ID mismatches and silent drops.
 let typeBuffer = '';
 let typeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -76,16 +73,30 @@ function flushTypeBuffer(): void {
   );
 }
 
+// ── Cmd+V paste intercept ─────────────────────────────────────────
+// CDP Input.dispatchKeyEvent for Cmd+V cannot access the macOS pasteboard.
+// Instead: read clipboard with pbpaste and inject via Input.insertText.
+function handlePaste(): void {
+  try {
+    const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
+    if (!text) { console.log('[relay] paste: clipboard empty'); return; }
+    console.log('[relay] paste:', JSON.stringify(text.slice(0, 80)));
+    handleAction({ type: 'type', value: text }).catch((err) =>
+      console.error('[relay] paste error:', (err as Error).message)
+    );
+  } catch (err) {
+    console.error('[relay] pbpaste failed:', (err as Error).message);
+  }
+}
+
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
-  // ── /stream/push — kept for extension backward-compat (ignored if CDP active)
   if (url === '/stream/push') {
     console.log('[relay] ▲ streamer connected (extension frame push — CDP mode ignores this)');
-    ws.on('message', () => {}); // drain
+    ws.on('message', () => {});
     ws.on('close', () => console.log('[relay] ▼ streamer disconnected'));
 
-  // ── /stream — viewer receives JPEG frames ─────────────────────────────
   } else if (url === '/stream') {
     streamViewers.add(ws);
     console.log(`[relay] ▲ stream-viewer connected (total: ${streamViewers.size})`);
@@ -94,7 +105,6 @@ wss.on('connection', (ws, req) => {
       console.log('[relay] ▼ stream-viewer disconnected');
     });
 
-  // ── /actions — Comet sends actions; relay injects via CDP ─────────────
   } else if (url === '/actions') {
     let isReceiver = false;
 
@@ -102,7 +112,6 @@ wss.on('connection', (ws, req) => {
       let parsed: Record<string, unknown> | null = null;
       try { parsed = JSON.parse(raw instanceof Buffer ? raw.toString() : String(raw)); } catch (_) {}
 
-      // Extension registration handshake — acknowledge but don't rely on it
       if (parsed?.register === 'extension') {
         isReceiver = true;
         console.log('[relay] ▲ action-receiver (ext) connected — CDP mode: extension ignored for input');
@@ -112,15 +121,27 @@ wss.on('connection', (ws, req) => {
       if (!isReceiver) {
         if (!parsed) return;
 
-        // Buffer rapid single-char type actions, flush as one insertText call
-        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
-          typeBuffer += parsed.value as string;
-          if (typeTimer) clearTimeout(typeTimer);
-          typeTimer = setTimeout(flushTypeBuffer, 40);
+        // Intercept Cmd+V: read macOS clipboard and inject as insertText
+        if (
+          parsed.type === 'keydown' &&
+          parsed.key === 'v' &&
+          parsed.metaKey === true
+        ) {
+          flushTypeBuffer();
+          console.log('[relay] action → Cmd+V (intercepted as paste)');
+          handlePaste();
           return;
         }
 
-        // Any non-type action: flush pending chars first to preserve ordering
+        // Buffer rapid single-char type actions
+        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
+          typeBuffer += parsed.value as string;
+          if (typeTimer) clearTimeout(typeTimer);
+          typeTimer = setTimeout(flushTypeBuffer, 200);
+          return;
+        }
+
+        // Flush buffer before any other action
         flushTypeBuffer();
         if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
 
@@ -154,10 +175,9 @@ server.listen(PORT, async () => {
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
-  // Connect to Chrome CDP
   try {
     await connectCDP(broadcastFrame);
-    startScreenshots(5); // #46: 5 FPS so Comet sees feedback fast enough to not self-correct
+    startScreenshots(5);
     console.log('[relay] CDP ready — input + screenshots active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);

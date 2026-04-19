@@ -29,11 +29,25 @@
   <canvas id="screen"></canvas>
   <div id="status">connecting…</div>
 
+  <!-- Hidden editable proxy so Comet's automation has a real editable target.
+       Without this, browsers never dispatch beforeinput (only fires on editable
+       elements), so Comet's bulk type path silently no-ops. -->
+  <div id="inputProxy"
+       contenteditable="true"
+       spellcheck="false"
+       autocomplete="off"
+       aria-hidden="true"
+       style="position:fixed; left:-9999px; top:-9999px;
+              width:1px; height:1px; opacity:0;
+              outline:none; white-space:pre; overflow:hidden;">
+  </div>
+
   <script>
     const PORT   = 7001;
     const canvas = document.getElementById('screen');
     const ctx    = canvas.getContext('2d');
     const status = document.getElementById('status');
+    const proxy  = document.getElementById('inputProxy');
 
     // Match canvas resolution to display
     function resize() {
@@ -43,7 +57,7 @@
     resize();
     window.addEventListener('resize', resize);
 
-    // ── Actions WS (viewer → relay → extension) ─────────────────────
+    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -52,19 +66,21 @@
         actWs.send(JSON.stringify(action));
     }
 
-    // ── Mouse: click + mousemove (throttled) ─────────────────────
+    // ── Mouse: click + mousemove (throttled) ─────────────────────────
     canvas.addEventListener('click', (e) => {
       send({
         type: 'click',
         x: e.offsetX / canvas.width,
         y: e.offsetY / canvas.height,
       });
+      // Park focus on the proxy so Comet's type/beforeinput lands on an editable
+      proxy.focus();
     });
 
     let lastMove = 0;
     canvas.addEventListener('mousemove', (e) => {
       const now = Date.now();
-      if (now - lastMove < 50) return; // throttle to 20Hz
+      if (now - lastMove < 50) return;
       lastMove = now;
       send({
         type: 'mousemove',
@@ -73,13 +89,50 @@
       });
     });
 
-    // ── Scroll ───────────────────────────────────────────
+    // ── Scroll ───────────────────────────────────────────────
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       send({ type: 'scroll', x: e.deltaX, y: e.deltaY });
     }, { passive: false });
 
-    // ── Keyboard ──────────────────────────────────────────
+    // ── Proxy: receives Comet's beforeinput / paste ────────────────────
+    // beforeinput fires on contenteditable for both single chars AND bulk strings
+    proxy.addEventListener('beforeinput', (e) => {
+      e.preventDefault();
+      if (e.inputType === 'insertText' && e.data && !e.isComposing) {
+        send({ type: 'type', value: e.data });
+      } else if (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') {
+        send({ type: 'keydown', key: 'Enter', code: 'Enter', shiftKey: false, ctrlKey: false, metaKey: false });
+      } else if (e.inputType === 'deleteContentBackward') {
+        send({ type: 'keydown', key: 'Backspace', code: 'Backspace', shiftKey: false, ctrlKey: false, metaKey: false });
+      }
+    });
+
+    // Drain any text that slips into the proxy DOM
+    proxy.addEventListener('input', () => {
+      if (proxy.textContent) {
+        const v = proxy.textContent;
+        proxy.textContent = '';
+        send({ type: 'type', value: v });
+      }
+    });
+
+    // Handle paste into proxy
+    proxy.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData.getData('text');
+      if (text) send({ type: 'type', value: text });
+    });
+
+    // Keep proxy focused when focus drifts to body
+    document.addEventListener('focusout', () => {
+      setTimeout(() => { if (document.activeElement === document.body) proxy.focus(); }, 0);
+    });
+    proxy.focus();
+
+    // ── Keyboard: special keys + shortcuts ──────────────────────────
+    // Single printable chars from human keyboard still come through keydown.
+    // Special keys (Enter, Backspace, arrows) and shortcuts are handled here.
     document.addEventListener('keydown', (e) => {
       // Don't intercept browser shortcuts
       if (e.metaKey && ['r','l','t','w','n'].includes(e.key.toLowerCase())) return;
@@ -87,6 +140,7 @@
       e.preventDefault();
 
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+        // Printable char from human typing — proxy's beforeinput handles Comet's chars
         send({ type: 'type', value: e.key });
       } else {
         send({
@@ -100,17 +154,7 @@
       }
     });
 
-    // Capture Comet's bulk text — dispatched as beforeinput, not keydown.
-    // Must use capture phase (true) so we fire before Lexical/ProseMirror
-    // calls stopPropagation in the bubble phase.
-    document.addEventListener('beforeinput', (e) => {
-      if (e.inputType === 'insertText' && e.data && e.data.length > 1 && !e.isComposing) {
-        e.preventDefault();
-        send({ type: 'type', value: e.data });
-      }
-    }, true);
-
-    // ── Stream WS (relay → viewer): receive binary JPEG frames ──────────
+    // ── Stream WS (relay → viewer): receive binary JPEG frames ───────────
     const streamWs = new WebSocket(`ws://localhost:${PORT}/stream`);
     streamWs.binaryType = 'blob';
 

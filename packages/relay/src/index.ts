@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import express from 'express';
 import { createServer, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -12,7 +13,7 @@ const PORT = Number(process.env.PORT ?? 7001);
 const app    = express();
 const server = createServer(app);
 
-// ── CORS + static viewer ─────────────────────────────────────────────────────
+// ── CORS + static viewer ────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 
 app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
@@ -24,7 +25,7 @@ app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => res.sendFile(path.join(publicDir, 'live.html')));
 
-// ── Asset proxy ───────────────────────────────────────────────────────────────
+// ── Asset proxy ────────────────────────────────────────────────────
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -43,15 +44,14 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPConnected() }));
 
-// ── WebSocket channels ────────────────────────────────────────────────────────
+// ── WebSocket channels ────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
-const streamViewers = new Set<WebSocket>(); // live viewer tabs
+const streamViewers = new Set<WebSocket>();
 
-// Send a JPEG buffer to all connected viewers
 function broadcastFrame(jpeg: Buffer): void {
   const data = jpeg.buffer.slice(jpeg.byteOffset, jpeg.byteOffset + jpeg.byteLength);
   for (const v of streamViewers) {
@@ -59,16 +59,44 @@ function broadcastFrame(jpeg: Buffer): void {
   }
 }
 
+// ── Single-char type coalescing (#45) ────────────────────────────────
+let typeBuffer = '';
+let typeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushTypeBuffer(): void {
+  if (!typeBuffer) return;
+  const text = typeBuffer;
+  typeBuffer = '';
+  console.log('[relay] flush type:', JSON.stringify(text.slice(0, 80)));
+  handleAction({ type: 'type', value: text }).catch((err) =>
+    console.error('[relay] flush error:', (err as Error).message)
+  );
+}
+
+// ── Cmd+V paste intercept ─────────────────────────────────────────
+// CDP Input.dispatchKeyEvent for Cmd+V cannot access the macOS pasteboard.
+// Instead: read clipboard with pbpaste and inject via Input.insertText.
+function handlePaste(): void {
+  try {
+    const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
+    if (!text) { console.log('[relay] paste: clipboard empty'); return; }
+    console.log('[relay] paste:', JSON.stringify(text.slice(0, 80)));
+    handleAction({ type: 'type', value: text }).catch((err) =>
+      console.error('[relay] paste error:', (err as Error).message)
+    );
+  } catch (err) {
+    console.error('[relay] pbpaste failed:', (err as Error).message);
+  }
+}
+
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
-  // ── /stream/push — kept for extension backward-compat (ignored if CDP active)
   if (url === '/stream/push') {
     console.log('[relay] ▲ streamer connected (extension frame push — CDP mode ignores this)');
-    ws.on('message', () => {}); // drain
+    ws.on('message', () => {});
     ws.on('close', () => console.log('[relay] ▼ streamer disconnected'));
 
-  // ── /stream — viewer receives JPEG frames ─────────────────────────────────
   } else if (url === '/stream') {
     streamViewers.add(ws);
     console.log(`[relay] ▲ stream-viewer connected (total: ${streamViewers.size})`);
@@ -77,7 +105,6 @@ wss.on('connection', (ws, req) => {
       console.log('[relay] ▼ stream-viewer disconnected');
     });
 
-  // ── /actions — Comet sends actions; relay injects via CDP ─────────────────
   } else if (url === '/actions') {
     let isReceiver = false;
 
@@ -85,7 +112,6 @@ wss.on('connection', (ws, req) => {
       let parsed: Record<string, unknown> | null = null;
       try { parsed = JSON.parse(raw instanceof Buffer ? raw.toString() : String(raw)); } catch (_) {}
 
-      // Extension registration handshake — acknowledge but don't rely on it
       if (parsed?.register === 'extension') {
         isReceiver = true;
         console.log('[relay] ▲ action-receiver (ext) connected — CDP mode: extension ignored for input');
@@ -93,15 +119,38 @@ wss.on('connection', (ws, req) => {
       }
 
       if (!isReceiver) {
-        // Action from Comet → inject directly via CDP
-        if (parsed) {
-          if (parsed.type !== 'mousemove') {
-            console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
-          }
-          handleAction(parsed).catch((err) => {
-            console.error('[relay] CDP action error:', (err as Error).message ?? err);
-          });
+        if (!parsed) return;
+
+        // Intercept Cmd+V: read macOS clipboard and inject as insertText
+        if (
+          parsed.type === 'keydown' &&
+          parsed.key === 'v' &&
+          parsed.metaKey === true
+        ) {
+          flushTypeBuffer();
+          console.log('[relay] action → Cmd+V (intercepted as paste)');
+          handlePaste();
+          return;
         }
+
+        // Buffer rapid single-char type actions
+        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
+          typeBuffer += parsed.value as string;
+          if (typeTimer) clearTimeout(typeTimer);
+          typeTimer = setTimeout(flushTypeBuffer, 200);
+          return;
+        }
+
+        // Flush buffer before any other action
+        flushTypeBuffer();
+        if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
+
+        if (parsed.type !== 'mousemove') {
+          console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
+        }
+        handleAction(parsed).catch((err) => {
+          console.error('[relay] CDP action error:', (err as Error).message ?? err);
+        });
       }
     });
 
@@ -126,10 +175,9 @@ server.listen(PORT, async () => {
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
-  // Connect to Chrome CDP
   try {
     await connectCDP(broadcastFrame);
-    startScreenshots(1);
+    startScreenshots(5);
     console.log('[relay] CDP ready — input + screenshots active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);

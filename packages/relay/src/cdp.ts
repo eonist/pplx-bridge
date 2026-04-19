@@ -92,22 +92,38 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
   }
 
   if (type === 'type') {
-    // Comet sends type immediately after click — wait for DOM focus to settle
     const sinceClick = Date.now() - lastClickAt;
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
-    console.log('[cdp] type:', JSON.stringify(text.slice(0, 60)));
-    if (text.length === 1) {
-      // Single char: existing path works fine
-      await send('Input.dispatchKeyEvent', { type: 'char', key: text, text, unmodifiedText: text });
-    } else {
-      // Bulk string: execCommand fires the native input pipeline that
-      // React/ProseMirror/Lexical all respond to — no char loop, no CDP round-trips per char
-      await send('Runtime.evaluate', {
-        expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
-        awaitPromise: false,
-      });
-    }
+    console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
+
+    // Focus the Lexical contenteditable and insert text in one JS call.
+    // execCommand('insertText') goes through the browser's native input pipeline
+    // (beforeinput -> input events) which React/Lexical/ProseMirror all respond to.
+    const result = await send('Runtime.evaluate', {
+      expression: `(function() {
+  var el = document.querySelector('[data-lexical-editor="true"]');
+  if (!el) el = document.activeElement;
+  if (el) { el.focus(); }
+  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
+  return ok;
+})()`,
+      returnByValue: true,
+      awaitPromise: false,
+    }) as { result: { value: unknown } };
+    console.log('[cdp] execCommand result:', result?.result?.value);
+
+    // Tickle Lexical into syncing its EditorState after execCommand.
+    // execCommand writes to the DOM but Lexical's internal state tree may not
+    // reconcile until a real keypress event arrives. Without this, a subsequent
+    // Enter fires into stale state and does nothing. Space+Backspace is invisible
+    // to the user but forces Lexical to process the input event pipeline.
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    console.log('[cdp] lexical state synced via space+backspace');
     return;
   }
 
@@ -122,6 +138,16 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const vk        = keyCode(key);
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
+      // Re-focus Lexical before Enter so the submit lands in the composer.
+      // After execCommand('insertText'), focus can silently drift to <body>;
+      // rawKeyDown for Enter then fires into the void.
+      if (key === 'Enter' && !modifiers) {
+        await send('Runtime.evaluate', {
+          expression: `(function() { var el = document.querySelector('[data-lexical-editor="true"]'); if (el) el.focus(); })()`,
+          awaitPromise: false,
+        });
+        await new Promise(r => setTimeout(r, 30));
+      }
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       console.log('[cdp] key:', key, modifiers ? `(modifiers:${modifiers})` : '');

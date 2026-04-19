@@ -1,5 +1,5 @@
 // src/background.ts — service worker (CDP only; WebSockets live in offscreen.ts)
-const FPS     = 4;
+const FPS     = 1;   // Chrome quota: MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND = 2
 const QUALITY = 0.6;
 
 let capturing       = false;
@@ -129,7 +129,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     console.error('[bg] offscreen create failed:', err);
   }
 
-  // 3. Frame capture loop — sends JPEG frames to offscreen for forwarding to relay
+  // 3. Frame capture loop — 1 fps to stay under Chrome quota (max 2/sec)
   intervalId = setInterval(async () => {
     if (!capturing) return;
     if (capturing_frame) return;

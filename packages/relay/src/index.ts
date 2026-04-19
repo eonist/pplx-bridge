@@ -12,7 +12,7 @@ const PORT = Number(process.env.PORT ?? 7001);
 const app    = express();
 const server = createServer(app);
 
-// ── CORS + static viewer ─────────────────────────────────────────────────────
+// ── CORS + static viewer ────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 
 app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
@@ -24,7 +24,7 @@ app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => res.sendFile(path.join(publicDir, 'live.html')));
 
-// ── Asset proxy ───────────────────────────────────────────────────────────────
+// ── Asset proxy ────────────────────────────────────────────────────
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -43,10 +43,10 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPConnected() }));
 
-// ── WebSocket channels ────────────────────────────────────────────────────────
+// ── WebSocket channels ────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
 const streamViewers = new Set<WebSocket>(); // live viewer tabs
@@ -59,6 +59,23 @@ function broadcastFrame(jpeg: Buffer): void {
   }
 }
 
+// ── Single-char type coalescing (#45) ────────────────────────────────
+// Comet sends one {type:'type',value:'x'} per character in rapid succession.
+// Buffering them and flushing as one call eliminates 60 serial CDP round-trips
+// for a long string, preventing response ID mismatches and silent drops.
+let typeBuffer = '';
+let typeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushTypeBuffer(): void {
+  if (!typeBuffer) return;
+  const text = typeBuffer;
+  typeBuffer = '';
+  console.log('[relay] flush type:', JSON.stringify(text.slice(0, 80)));
+  handleAction({ type: 'type', value: text }).catch((err) =>
+    console.error('[relay] flush error:', (err as Error).message)
+  );
+}
+
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
 
@@ -68,7 +85,7 @@ wss.on('connection', (ws, req) => {
     ws.on('message', () => {}); // drain
     ws.on('close', () => console.log('[relay] ▼ streamer disconnected'));
 
-  // ── /stream — viewer receives JPEG frames ─────────────────────────────────
+  // ── /stream — viewer receives JPEG frames ─────────────────────────────
   } else if (url === '/stream') {
     streamViewers.add(ws);
     console.log(`[relay] ▲ stream-viewer connected (total: ${streamViewers.size})`);
@@ -77,7 +94,7 @@ wss.on('connection', (ws, req) => {
       console.log('[relay] ▼ stream-viewer disconnected');
     });
 
-  // ── /actions — Comet sends actions; relay injects via CDP ─────────────────
+  // ── /actions — Comet sends actions; relay injects via CDP ─────────────
   } else if (url === '/actions') {
     let isReceiver = false;
 
@@ -93,15 +110,26 @@ wss.on('connection', (ws, req) => {
       }
 
       if (!isReceiver) {
-        // Action from Comet → inject directly via CDP
-        if (parsed) {
-          if (parsed.type !== 'mousemove') {
-            console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
-          }
-          handleAction(parsed).catch((err) => {
-            console.error('[relay] CDP action error:', (err as Error).message ?? err);
-          });
+        if (!parsed) return;
+
+        // Buffer rapid single-char type actions, flush as one insertText call
+        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
+          typeBuffer += parsed.value as string;
+          if (typeTimer) clearTimeout(typeTimer);
+          typeTimer = setTimeout(flushTypeBuffer, 40);
+          return;
         }
+
+        // Any non-type action: flush pending chars first to preserve ordering
+        flushTypeBuffer();
+        if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
+
+        if (parsed.type !== 'mousemove') {
+          console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
+        }
+        handleAction(parsed).catch((err) => {
+          console.error('[relay] CDP action error:', (err as Error).message ?? err);
+        });
       }
     });
 
@@ -129,7 +157,7 @@ server.listen(PORT, async () => {
   // Connect to Chrome CDP
   try {
     await connectCDP(broadcastFrame);
-    startScreenshots(1);
+    startScreenshots(5); // #46: 5 FPS so Comet sees feedback fast enough to not self-correct
     console.log('[relay] CDP ready — input + screenshots active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);

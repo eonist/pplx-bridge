@@ -113,17 +113,18 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     }) as { result: { value: unknown } };
     console.log('[cdp] execCommand result:', result?.result?.value);
 
-    // Tickle Lexical into syncing its EditorState after execCommand.
-    // execCommand writes to the DOM but Lexical's internal state tree may not
-    // reconcile until a real keypress event arrives. Without this, a subsequent
-    // Enter fires into stale state and does nothing. Space+Backspace is invisible
-    // to the user but forces Lexical to process the input event pipeline.
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
-    await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-    console.log('[cdp] lexical state synced via space+backspace');
+    // Only tickle Lexical EditorState sync for bulk strings (Comet-sent prompts).
+    // Single chars typed by a human go through the native keyDown/char/keyUp pipeline
+    // which keeps Lexical in sync automatically — the space+backspace here would
+    // cause a visible extra character on every human keystroke (#66).
+    if (text.length > 1) {
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
+      await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+      console.log('[cdp] lexical state synced via space+backspace');
+    }
     return;
   }
 

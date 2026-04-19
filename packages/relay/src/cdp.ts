@@ -2,6 +2,7 @@
  * cdp.ts — direct Chrome DevTools Protocol client.
  */
 import { WebSocket } from 'ws';
+import { execSync } from 'child_process';
 
 let cdpWs: WebSocket | null = null;
 let msgId = 1;
@@ -79,6 +80,15 @@ async function dispatchChar(ch: string): Promise<void> {
   await send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
 }
 
+/** Read macOS clipboard via pbpaste. Returns empty string on error. */
+function readClipboard(): string {
+  try {
+    return execSync('pbpaste', { encoding: 'utf8' });
+  } catch {
+    return '';
+  }
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -106,14 +116,11 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 60)));
     if (text.length === 1) {
-      // Single char: full keyDown→char→keyUp so Lexical/ProseMirror registers it
       await dispatchChar(text);
     } else {
-      // Bulk string (coalesced by index.ts): one execCommand call, no CDP queue pressure
-      await send('Runtime.evaluate', {
-        expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
-        awaitPromise: false,
-      });
+      // Bulk string: use Input.insertText (native CDP, no execCommand deprecation issues)
+      await send('Input.insertText', { text });
+      console.log('[cdp] insertText:', JSON.stringify(text.slice(0, 60)));
     }
     return;
   }
@@ -128,6 +135,17 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
     const vk        = keyCode(key);
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
+
+    // Intercept Cmd+V: read macOS clipboard and inject via Input.insertText
+    if (meta && key === 'v') {
+      const clipboard = readClipboard();
+      if (clipboard) {
+        console.log('[cdp] paste via pbpaste:', JSON.stringify(clipboard.slice(0, 80)));
+        await send('Input.insertText', { text: clipboard });
+      }
+      return;
+    }
+
     if (special.includes(key) || modifiers) {
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });

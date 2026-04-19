@@ -97,9 +97,10 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
 
-    // Focus the Lexical contenteditable and insert text in one JS call.
-    // execCommand('insertText') goes through the browser's native input pipeline
-    // (beforeinput -> input events) which React/Lexical/ProseMirror all respond to.
+    // Focus the Lexical contenteditable and insert text via execCommand.
+    // execCommand('insertText') is the only trusted insertion path from a CDP session —
+    // synthetic InputEvent/beforeinput dispatched via Runtime.evaluate have isTrusted:false
+    // which Lexical ignores. Input.insertText is a no-op without OS-level focus.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -112,19 +113,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
       awaitPromise: false,
     }) as { result: { value: unknown } };
     console.log('[cdp] execCommand result:', result?.result?.value);
-
-    // Only tickle Lexical EditorState sync for bulk strings (Comet-sent prompts).
-    // Single chars typed by a human go through the native keyDown/char/keyUp pipeline
-    // which keeps Lexical in sync automatically — the space+backspace here would
-    // cause a visible extra character on every human keystroke (#66).
-    if (text.length > 1) {
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
-      await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
-      await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-      await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
-      console.log('[cdp] lexical state synced via space+backspace');
-    }
     return;
   }
 
@@ -139,15 +127,18 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const vk        = keyCode(key);
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
-      // Re-focus Lexical before Enter so the submit lands in the composer.
-      // After execCommand('insertText'), focus can silently drift to <body>;
-      // rawKeyDown for Enter then fires into the void.
       if (key === 'Enter' && !modifiers) {
-        await send('Runtime.evaluate', {
-          expression: `(function() { var el = document.querySelector('[data-lexical-editor="true"]'); if (el) el.focus(); })()`,
-          awaitPromise: false,
-        });
-        await new Promise(r => setTimeout(r, 30));
+        // Sync Lexical EditorState immediately before Enter.
+        // execCommand('insertText') writes to the DOM but Lexical's internal state
+        // tree may not reconcile until a real keypress arrives. A space+backspace
+        // here is invisible to the user but forces Lexical to process the input
+        // event pipeline so the subsequent Enter submit fires correctly.
+        // This is placed on Enter (not on type) so human typing is never affected.
+        await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
+        await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
+        await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
+        await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+        await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
       }
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });

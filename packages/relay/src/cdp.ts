@@ -2,6 +2,7 @@
  * cdp.ts — direct Chrome DevTools Protocol client.
  */
 import { WebSocket } from 'ws';
+import { execSync } from 'child_process';
 
 let cdpWs: WebSocket | null = null;
 let msgId = 1;
@@ -70,6 +71,18 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+/**
+ * Dispatch a single printable character via the full keyDown → char → keyUp
+ * sequence that Lexical / ProseMirror / React require to register input.
+ * A bare `char` event without a preceding `keyDown` is silently ignored.
+ */
+async function dispatchChar(ch: string): Promise<void> {
+  const base = { key: ch, text: ch, unmodifiedText: ch };
+  await send('Input.dispatchKeyEvent', { ...base, type: 'keyDown' });
+  await send('Input.dispatchKeyEvent', { ...base, type: 'char' });
+  await send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -92,29 +105,22 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
   }
 
   if (type === 'type') {
+    // Wait for DOM focus to settle after a click
     const sinceClick = Date.now() - lastClickAt;
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
-    console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-
-    // Focus the Lexical contenteditable and insert text in one JS call.
-    // execCommand('insertText') goes through the browser's native input pipeline
-    // (beforeinput -> input events) which React/Lexical/ProseMirror all respond to.
-    // This works for both single chars and full strings.
-    // We explicitly focus [data-lexical-editor] first; if not present, fall back to
-    // any focused/active contenteditable so execCommand has a valid target.
-    const result = await send('Runtime.evaluate', {
-      expression: `(function() {
-  var el = document.querySelector('[data-lexical-editor="true"]');
-  if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
-  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
-})()`,
-      returnByValue: true,
-      awaitPromise: false,
-    }) as { result: { value: unknown } };
-    console.log('[cdp] execCommand result:', result?.result?.value);
+    console.log('[cdp] type:', JSON.stringify(text.slice(0, 60)));
+    if (text.length === 1) {
+      // Single char: full keyDown → char → keyUp so Lexical registers it
+      await dispatchChar(text);
+    } else {
+      // Bulk string: execCommand fires the native input pipeline that
+      // React/ProseMirror/Lexical all respond to
+      await send('Runtime.evaluate', {
+        expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
+        awaitPromise: false,
+      });
+    }
     return;
   }
 
@@ -128,6 +134,23 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
     const vk        = keyCode(key);
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
+
+    // Intercept Cmd+V: read macOS clipboard via pbpaste and inject as text.
+    // CDP cannot access the system pasteboard, so a raw Cmd+V rawKeyDown is a no-op.
+    if (meta && key.toLowerCase() === 'v') {
+      try {
+        const text = execSync('pbpaste', { encoding: 'utf8', timeout: 500 }).trim();
+        if (text) {
+          await send('Runtime.evaluate', {
+            expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
+            awaitPromise: false,
+          });
+          console.log('[cdp] paste via pbpaste:', JSON.stringify(text.slice(0, 60)));
+        }
+      } catch { /* pbpaste failed or clipboard empty */ }
+      return;
+    }
+
     if (special.includes(key) || modifiers) {
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });

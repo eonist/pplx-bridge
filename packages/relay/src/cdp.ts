@@ -70,6 +70,15 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+/** Dispatch a single printable character using the full keyDown→char→keyUp sequence.
+ *  ProseMirror/Lexical require keyDown before they accept the char event. */
+async function dispatchChar(ch: string): Promise<void> {
+  const base = { key: ch, text: ch, unmodifiedText: ch };
+  await send('Input.dispatchKeyEvent', { ...base, type: 'keyDown' });
+  await send('Input.dispatchKeyEvent', { ...base, type: 'char' });
+  await send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -92,17 +101,15 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
   }
 
   if (type === 'type') {
-    // Comet sends type immediately after click — wait for DOM focus to settle
     const sinceClick = Date.now() - lastClickAt;
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 60)));
     if (text.length === 1) {
-      // Single char: existing path works fine
-      await send('Input.dispatchKeyEvent', { type: 'char', key: text, text, unmodifiedText: text });
+      // Single char: full keyDown→char→keyUp so Lexical/ProseMirror registers it
+      await dispatchChar(text);
     } else {
-      // Bulk string: execCommand fires the native input pipeline that
-      // React/ProseMirror/Lexical all respond to — no char loop, no CDP round-trips per char
+      // Bulk string (coalesced by index.ts): one execCommand call, no CDP queue pressure
       await send('Runtime.evaluate', {
         expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
         awaitPromise: false,

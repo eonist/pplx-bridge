@@ -81,11 +81,25 @@ wss.on('connection', (ws, req) => {
   } else if (url === '/actions') {
     let isReceiver = false;
 
+    // #45: coalesce rapid single-char type bursts → one insertText call
+    let typeBuffer = '';
+    let typeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function flushTypeBuffer() {
+      if (!typeBuffer) return;
+      const text = typeBuffer;
+      typeBuffer = '';
+      console.log('[relay] flush type:', JSON.stringify(text.slice(0, 80)));
+      handleAction({ type: 'type', value: text }).catch((err) =>
+        console.error('[relay] flush error:', (err as Error).message)
+      );
+    }
+
     ws.on('message', (raw) => {
       let parsed: Record<string, unknown> | null = null;
       try { parsed = JSON.parse(raw instanceof Buffer ? raw.toString() : String(raw)); } catch (_) {}
 
-      // Extension registration handshake — acknowledge but don't rely on it
+      // Extension registration handshake
       if (parsed?.register === 'extension') {
         isReceiver = true;
         console.log('[relay] ▲ action-receiver (ext) connected — CDP mode: extension ignored for input');
@@ -93,19 +107,31 @@ wss.on('connection', (ws, req) => {
       }
 
       if (!isReceiver) {
-        // Action from Comet → inject directly via CDP
-        if (parsed) {
-          if (parsed.type !== 'mousemove') {
-            console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
-          }
-          handleAction(parsed).catch((err) => {
-            console.error('[relay] CDP action error:', (err as Error).message ?? err);
-          });
+        if (!parsed) return;
+
+        // Buffer single-char type actions and flush after 40ms silence
+        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
+          typeBuffer += parsed.value;
+          if (typeTimer) clearTimeout(typeTimer);
+          typeTimer = setTimeout(flushTypeBuffer, 40);
+          return;
         }
+
+        // Any non-type action: flush pending chars first to preserve ordering
+        flushTypeBuffer();
+        if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
+
+        if (parsed.type !== 'mousemove') {
+          console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
+        }
+        handleAction(parsed).catch((err) => {
+          console.error('[relay] CDP action error:', (err as Error).message ?? err);
+        });
       }
     });
 
     ws.on('close', () => {
+      flushTypeBuffer();
       if (isReceiver) console.log('[relay] ▼ action-receiver (ext) disconnected');
     });
   }
@@ -126,7 +152,6 @@ server.listen(PORT, async () => {
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
-  // Connect to Chrome CDP
   try {
     await connectCDP(broadcastFrame);
     startScreenshots(1);

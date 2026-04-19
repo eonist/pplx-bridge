@@ -1,1 +1,36 @@
-bmFtZTogQnVpbGQKCm9uOgogIHB1c2g6CiAgICBicmFuY2hlczogW21haW5dCiAgcHVsbF9yZXF1ZXN0OgogICAgdHlwZXM6IFtvcGVuZWQsIHN5bmNocm9uaXplLCByZW9wZW5lZF0KCmNvbmN1cnJlbmN5OgogIGdyb3VwOiAkeyB7IGdpdGh1Yi53b3JrZmxvdyB9IH0tJHt7IGdpdGh1Yi5yZWYgfX0KICBjYW5jZWwtaW4tcHJvZ3Jlc3M6IHRydWUKCmpvYnM6CiAgYnVpbGQ6CiAgICBuYW1lOiBCdWlsZCBhbGwgcGFja2FnZXMKICAgIHJ1bnMtb246IHVidW50dS1sYXRlc3QKICAgIHN0ZXBzOgogICAgICAtIG5hbWU6IENoZWNrb3V0CiAgICAgICAgdXNlczogYWN0aW9ucy9jaGVja291dEB2NAoKICAgICAgLSBuYW1lOiBTZXR1cCBwbnBtCiAgICAgICAgdXNlczogcG5wbS9hY3Rpb24tc2V0dXBAdjMKICAgICAgICB3aXRoOgogICAgICAgICAgdmVyc2lvbjogOQoKICAgICAgLSBuYW1lOiBTZXR1cCBOb2RlLmpzCiAgICAgICAgdXNlczogYWN0aW9ucy9zZXR1cC1ub2RlQHY0CiAgICAgICAgd2l0aDoKICAgICAgICAgIG5vZGUtdmVyc2lvbjogMjAKICAgICAgICAgIGNhY2hlOiBwbnBtCgogICAgICAtIG5hbWU6IEluc3RhbGwgZGVwZW5kZW5jaWVzCiAgICAgICAgcnVuOiBwbnBtIGluc3RhbGwgLS1mcm96ZW4tbG9ja2ZpbGUKCiAgICAgIC0gbmFtZTogQnVpbGQKICAgICAgICBydW46IHBucG0gYnVpbGQK
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build all packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build

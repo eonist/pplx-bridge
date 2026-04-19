@@ -1,211 +1,214 @@
-# pplx-bridge
+<div align="center">
+  <h1>🌉 pplx-bridge</h1>
 
-Stream a live Chrome tab (`perplexity.ai`) as a JPEG feed to a local relay, then point **Comet** at `http://localhost:7001/live`. Comet Assistant sees the live page as a video stream and sends clicks, keystrokes, and scrolls back through the relay via **Chrome DevTools Protocol (CDP)**.
+  <p>
+    <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D_20-brightgreen.svg?style=flat-square" alt="Node.js Version" /></a>
+    <a href="https://pnpm.io/"><img src="https://img.shields.io/badge/pnpm-%3E%3D_9-orange.svg?style=flat-square" alt="pnpm" /></a>
+    <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT" /></a>
+    <a href="https://github.com/eonist/pplx-bridge/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square" alt="PRs Welcome" /></a>
+  </p>
 
-```
-Chrome (perplexity.ai)                       Comet (live viewer)
-┌──────────────────────┐                    ┌─────────────────────┐
-│ CDP --remote-debugging  │◀──actions (WS)──│ canvas JPEG display  │
-│ port 9222               │                │ keydown/click sender │
-└──────────────────────┘                └─────────────────────┘
-          │ JPEG frames (WS)                         ↑
-          └─────────── localhost:7001 relay ───────────┘
+  <h3>A local relay to stream live Chrome tabs as interactive JPEG feeds for vision-based AI assistants.</h3>
+</div>
+
+---
+
+Stream a live Chrome tab (`perplexity.ai`) as a continuous feed to a local relay. Point **Comet** at the relay, and the Comet Assistant can "see" the page as a video stream—sending clicks, keystrokes, and scrolls back via the **Chrome DevTools Protocol (CDP)**.
+
+## 📸 See it in Action
+
+<div align="center">
+  <img src="pplx-bridge.gif" alt="pplx-bridge demo — Comet Assistant controlling Perplexity.ai" width="100%" />
+  <p><i>Comet Assistant interacting with a live Perplexity.ai tab via the local relay.</i></p>
+</div>
+
+---
+
+## 📑 Table of Contents
+
+- [Architecture](#️-architecture)
+- [Features](#-features)
+- [Installation & Setup](#-installation--setup)
+- [Configuration](#️-configuration)
+- [Action Types](#️-action-types)
+- [Project Structure](#️-project-structure)
+- [FAQ & Troubleshooting](#-faq--troubleshooting)
+
+---
+
+## 🏗️ Architecture
+
+The bridge operates by linking a debugging instance of Chrome to a local WebSocket relay, which then streams visual frames to the Comet viewer.
+
+```mermaid
+flowchart LR
+    subgraph Browser ["🌐 Chrome Browser"]
+        CDP["CDP (Port 9222)<br/>--remote-debugging"]
+    end
+    
+    subgraph Relay ["⚡ Node.js Relay (localhost:7001)"]
+        WS["WebSocket Server"]
+    end
+    
+    subgraph Viewer ["🚀 Comet Browser"]
+        Canvas["🖼️ live.html<br/>(Canvas JPEG Display)"]
+    end
+    
+    CDP -- "5 FPS JPEG Frames" --> WS
+    WS -- "Streams JPEG (WS)" --> Canvas
+    Canvas -- "Mouse & Key Actions (WS)" --> WS
+    WS -- "Injects Input via CDP" --> CDP
+    
+    style Browser fill:#f9f9f9,stroke:#333,stroke-width:2px
+    style Relay fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+    style Viewer fill:#f4fae8,stroke:#5c8a11,stroke-width:2px
 ```
 
 ---
 
-## Prerequisites
+## ✨ Features
 
-> ⚠️ **pplx-bridge only works with Chrome launched in remote debugging mode.** It will not work with a normal Chrome installation.
-
-This project uses the **Chrome DevTools Protocol (CDP)** for everything — screenshots, keyboard/mouse injection, and JavaScript evaluation. CDP is only available when Chrome is started with the `--remote-debugging-port` flag, which exposes a local WebSocket endpoint the relay connects to.
-
-**Without this flag:**
-- The relay cannot connect to Chrome (`connectCDP()` fails immediately)
-- No screenshots can be captured (`Page.captureScreenshot` is CDP-only)
-- No input can be injected (`Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`, `Runtime.evaluate` are all CDP-only)
-- The live viewer will show "disconnected"
-
-**Normal Chrome** (launched from Dock or Spotlight) does not expose CDP and cannot be used with this tool. You must always use the debug launch command in [Step 5](#5-start-chrome-with-remote-debugging).
+- 🚀 **Live Streaming** — Captures Chrome tabs as a low-latency JPEG feed at 5 FPS.
+- 🤖 **AI-Native** — Designed specifically for Comet Assistant to "see" live web pages.
+- 🖱️ **Full Interaction** — Translates clicks, keystrokes, and scrolls back to the browser via CDP.
+- 🔒 **Local & Secure** — Runs entirely on localhost, keeping browsing data and credentials private.
+- 🛠️ **Developer Friendly** — Clean WebSockets architecture built on Node.js and TypeScript.
 
 ---
 
-## 1. Install system dependencies (bare macOS)
+## 🚀 Installation & Setup
 
-### 1a. Xcode Command Line Tools
+Follow these stages to configure your environment and run the bridge.
+
+> [!WARNING]
+> **Chrome must be running in remote debugging mode.** Normal instances of Chrome (launched via Spotlight or the Dock) do not expose the required CDP WebSocket.
+
+### Stage 1: System Prerequisites (macOS)
+*(Skip to Stage 2 if you already have Node 20+ and pnpm installed).*
 ```bash
 xcode-select --install
-```
-A dialog appears — click **Install** and wait (~5 min).
-
-### 1b. Homebrew
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-At the end, run the two `echo` / `eval` commands it prints to add Homebrew to your PATH, then verify:
-```bash
-brew --version
-```
-
-### 1c. Node.js 20
-```bash
 brew install node@20
 echo 'export PATH="/opt/homebrew/opt/node@20/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
-node --version   # should print v20.x.x
+corepack enable && corepack prepare pnpm@latest --activate
 ```
 
-### 1d. pnpm
+### Stage 2: Install & Configure Browsers
+1. Download **[Google Chrome](https://www.google.com/chrome/)** and **[Comet](https://www.perplexity.ai/comet)**.
+2. Open Comet and navigate to **Settings → Assistant → Site access**.
+3. Click **Add site**, type `localhost`, and set it to **Full access**.
+
+> [!IMPORTANT]
+> Without granting full site access to `localhost`, Comet Assistant will be blocked from reading the canvas or interacting with the viewer page.
+
+### Stage 3: Clone & Build
 ```bash
-corepack enable
-corepack prepare pnpm@latest --activate
-pnpm --version   # 9+ or 10+
-```
-
----
-
-## 2. Install browsers
-
-### 2a. Google Chrome
-Download from [google.com/chrome](https://www.google.com/chrome/) and drag to `/Applications`.
-
-### 2b. Comet
-Download from [perplexity.ai/comet](https://www.perplexity.ai/comet) and drag to `/Applications`.
-
----
-
-## 3. Configure Comet
-
-1. Open Comet
-2. Go to **Settings → Assistant → Site access**
-3. Click **Add site**, type `localhost`, set to **Full access**
-
-> ⚠️ Without this step Comet Assistant cannot interact with the viewer page.
-
----
-
-## 4. Clone and install
-
-```bash
-git clone https://github.com/eonist/pplx-bridge
+git clone https://github.com/eonist/pplx-bridge.git
 cd pplx-bridge
 pnpm install
 ```
 
----
-
-## 5. Start Chrome with remote debugging
-
-Open a **new terminal tab** and run:
-
+### Stage 4: Launch Chrome (Debug Mode)
+Open a **new terminal tab** and launch an isolated Chrome profile:
 ```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/pplx-bridge-profile \
+  --user-data-dir=~/.pplx-bridge-profile \
   https://perplexity.ai
 ```
+*(Note: You will need to log into Perplexity on the first run. The custom `--user-data-dir` ensures your session persists across reboots.)*
 
-This launches an isolated Chrome profile pointed at Perplexity. Keep this terminal open.
-
-> **First run:** Chrome will be signed out — log in to Perplexity once. The session is saved in `/tmp/pplx-bridge-profile` and persists until you reboot. To keep your login across reboots use a permanent path:
-> ```bash
-> --user-data-dir=~/.pplx-bridge-profile
-> ```
-
----
-
-## 6. Start the relay
-
-In a **second terminal tab**:
-
+### Stage 5: Start the Relay & Connect
+In your **original terminal tab** (inside the `pplx-bridge` folder):
 ```bash
-cd ~/pplx-bridge
 pnpm start
 ```
+*When successful, the terminal will output:* `[relay] CDP ready — input + screenshots active`.
 
-You should see:
-```
-╔════════════════════════════════════════════╗
-║  pplx-bridge relay  →  localhost:7001            ║
-╚════════════════════════════════════════════╝
-[cdp] connected → https://www.perplexity.ai/ (viewport 929x598)
-[relay] CDP ready — input + screenshots active
-```
-
-If you see `[relay] CDP connect failed` — Chrome isn't running with `--remote-debugging-port=9222`. Go back to step 5.
+Finally, open **Comet** and navigate to `http://localhost:7001/live`. You will see the live JPEG stream with a **● live** status indicator in the bottom right.
 
 ---
 
-## 7. Open the viewer in Comet
+## ⚙️ Configuration
 
-Open **Comet** and navigate to:
-```
-http://localhost:7001/live
-```
-
-You should see a live JPEG stream of your Chrome tab. The status dot in the bottom-right reads **● live**.
-
-Comet Assistant can now click, type, and scroll on the live Perplexity page.
-
----
-
-## Individual commands
-
-```bash
-pnpm build      # build all packages
-pnpm start      # build + start relay (requires Chrome already running)
-```
-
----
-
-## Environment variables
+### Environment Variables
 
 | Variable | Default | Description |
-|---|---|---|
+| :--- | :--- | :--- |
 | `PORT` | `7001` | Relay HTTP/WS port (7000 is reserved by macOS AirPlay) |
 | `PPLX_BRIDGE_CDP_PORT` | `9222` | Chrome remote debugging port |
 
----
+### NPM Scripts
 
-## How it works
-
-1. Chrome starts with `--remote-debugging-port=9222`, exposing the CDP WebSocket
-2. The relay connects to CDP and starts capturing JPEG screenshots at 1 FPS
-3. Each JPEG frame is broadcast over `ws://localhost:7001/stream` to all viewer tabs
-4. `live.html` renders frames on a `<canvas>` — Comet sees the live page as a video feed
-5. Comet clicks or types → `live.html` sends the action to `ws://localhost:7001/actions`
-6. Relay receives the action and injects it into Chrome via CDP (`Input.dispatchMouseEvent`, `Input.insertText`, `Input.dispatchKeyEvent`)
+| Command | Action |
+| :--- | :--- |
+| `pnpm build` | Compiles TypeScript for all workspace packages |
+| `pnpm start` | Builds packages and starts the relay |
 
 ---
 
-## Action types
+## 🕹️ Action Types
 
-| Type | Payload | CDP method |
-|---|---|---|
+The WebSocket relay translates incoming JSON payloads from the viewer into the following Chrome DevTools Protocol commands:
+
+| Type | Payload | CDP Method |
+| :--- | :--- | :--- |
 | `click` | `{x, y}` normalised 0–1 | `Input.dispatchMouseEvent` |
-| `type` | `{value}` single char | `Input.insertText` |
+| `type` | `{value}` string (single char or bulk) | `Runtime.evaluate` → `execCommand('insertText')` |
 | `keydown` | `{key, code, modifiers}` | `Input.dispatchKeyEvent` |
 | `scroll` | `{x, y}` delta | `Input.dispatchMouseEvent` (mouseWheel) |
 | `mousemove` | `{x, y}` normalised 0–1 | `Input.dispatchMouseEvent` |
 
 ---
 
-## Troubleshooting
+## 🗂️ Project Structure
 
-| Problem | Fix |
-|---|---|
-| `command not found: pnpm` | `corepack enable && corepack prepare pnpm@latest --activate` |
-| `command not found: node` | `brew install node@20` + add to PATH (step 1c) |
-| `EADDRINUSE :::7001` | `lsof -ti :7001 \| xargs kill -9` then retry |
-| `[relay] CDP connect failed` | Chrome isn't running with `--remote-debugging-port=9222` — re-run step 5 |
-| Viewer shows "disconnected" | Relay not running — run `pnpm start` in the pplx-bridge folder |
-| Viewer shows blank / black | Chrome isn't on a visible page — click any tab in Chrome |
-| Comet Assistant does nothing | Set `localhost` to **Full access** in Comet → Settings → Site access |
-| `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND` | Run `cd ~/pplx-bridge` first |
-| Login lost after reboot | Use `--user-data-dir=~/.pplx-bridge-profile` (permanent path) |
+```text
+pplx-bridge/
+├── .github/             # GitHub Actions & issue templates
+├── packages/
+│   ├── extension/       # Chrome extension (action sender & frame pusher)
+│   ├── relay/           # Node.js WebSocket server & CDP client
+│   └── viewer/          # Static live.html canvas viewer
+├── ACTION_PROTOCOL.md   # Documentation for action payload format
+├── package.json         # Workspace configuration
+└── pnpm-workspace.yaml  # pnpm workspace definition
+```
 
 ---
 
-## Roadmap
+## 🚑 FAQ & Troubleshooting
 
-[github.com/eonist/pplx-bridge/issues](https://github.com/eonist/pplx-bridge/issues)
+<details>
+<summary><b>Viewer shows "disconnected"</b></summary>
+<br/>
+The relay is not running. Ensure you have run <code>pnpm start</code> in the <code>pplx-bridge</code> directory and that no errors were thrown.
+</details>
+
+<details>
+<summary><b>Viewer shows a blank or black screen</b></summary>
+<br/>
+Chrome is likely not focused on a visible page. Click any tab within the debugged Chrome window to force a frame update.
+</details>
+
+<details>
+<summary><b>Comet Assistant does nothing when prompted</b></summary>
+<br/>
+Comet does not have permission to interact with the local relay. Ensure <code>localhost</code> is set to <strong>Full access</strong> in Comet → Settings → Site access.
+</details>
+
+<details>
+<summary><b>Error: <code>[relay] CDP connect failed</code></b></summary>
+<br/>
+Chrome is not running with the required debugging flags. Stop Chrome completely and relaunch it using the command provided in Stage 4.
+</details>
+
+<details>
+<summary><b>Error: <code>EADDRINUSE :::7001</code></b></summary>
+<br/>
+The port is already in use by another process. Run <code>lsof -ti :7001 | xargs kill -9</code> to free the port, then retry.
+</details>
+
+<br/>
+
+> **Still having issues?** Contributions and bug reports are welcome! Please check the [Issues page](https://github.com/eonist/pplx-bridge/issues) for our current roadmap and known bugs.

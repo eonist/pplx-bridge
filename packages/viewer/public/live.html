@@ -91,8 +91,6 @@
 
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
         // Printable character — send as incremental type
-        // We accumulate into the active element on the remote side,
-        // so send the single character and let the injector append it.
         send({ type: 'type', value: e.key });
       } else {
         send({
@@ -103,6 +101,25 @@
           ctrlKey:  e.ctrlKey,
           metaKey:  e.metaKey,
         });
+      }
+    });
+
+    // ── Bulk text: capture Comet's beforeinput/input events ───────────────
+    // Comet's driver dispatches bulk text as beforeinput (inputType: "insertText")
+    // rather than individual keydown events. The keydown listener above never
+    // fires for these, so we capture them here and forward as a single type action.
+    document.addEventListener('beforeinput', (e) => {
+      if (e.inputType === 'insertText' && e.data && e.data.length > 1) {
+        e.preventDefault();
+        send({ type: 'type', value: e.data });
+      }
+    });
+
+    // Fallback: input event in case beforeinput is not fired
+    document.addEventListener('input', (e) => {
+      const text = e.data;
+      if (text && text.length > 1) {
+        send({ type: 'type', value: text });
       }
     });
 

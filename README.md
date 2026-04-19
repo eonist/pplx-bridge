@@ -17,9 +17,8 @@ Stream a live Chrome tab (`perplexity.ai`) as a continuous feed to a local relay
 
 ## 📸 See it in Action
 
-<!-- REPLACE THIS PLACEHOLDER WITH A REAL GIF OR SCREENSHOT -->
 <div align="center">
-  <img src="https://via.placeholder.com/800x400/1a1a1a/ffffff?text=Demo+GIF:+Comet+controlling+Perplexity.ai" alt="pplx-bridge demo" width="100%" />
+  <img src="pplx-bridge.gif" alt="pplx-bridge demo — Comet Assistant controlling Perplexity.ai" width="100%" />
   <p><i>Comet Assistant interacting with a live Perplexity.ai tab via the local relay.</i></p>
 </div>
 
@@ -55,7 +54,7 @@ flowchart LR
         Canvas["🖼️ live.html<br/>(Canvas JPEG Display)"]
     end
     
-    CDP -- "1 FPS JPEG Frames" --> WS
+    CDP -- "5 FPS JPEG Frames" --> WS
     WS -- "Streams JPEG (WS)" --> Canvas
     Canvas -- "Mouse & Key Actions (WS)" --> WS
     WS -- "Injects Input via CDP" --> CDP
@@ -69,7 +68,7 @@ flowchart LR
 
 ## ✨ Features
 
-- 🚀 **Live Streaming** — Captures Chrome tabs as a low-latency JPEG feed at 1 FPS.
+- 🚀 **Live Streaming** — Captures Chrome tabs as a low-latency JPEG feed at 5 FPS.
 - 🤖 **AI-Native** — Designed specifically for Comet Assistant to "see" live web pages.
 - 🖱️ **Full Interaction** — Translates clicks, keystrokes, and scrolls back to the browser via CDP.
 - 🔒 **Local & Secure** — Runs entirely on localhost, keeping browsing data and credentials private.
@@ -117,7 +116,7 @@ Open a **new terminal tab** and launch an isolated Chrome profile:
   --user-data-dir=~/.pplx-bridge-profile \
   https://perplexity.ai
 ```
-*(Note: You will need to log into Perplexity on the first run. The custom user-data-dir ensures your session persists across reboots).*
+*(Note: You will need to log into Perplexity on the first run. The custom `--user-data-dir` ensures your session persists across reboots.)*
 
 ### Stage 5: Start the Relay & Connect
 In your **original terminal tab** (inside the `pplx-bridge` folder):
@@ -145,8 +144,6 @@ Finally, open **Comet** and navigate to `http://localhost:7001/live`. You will s
 | :--- | :--- |
 | `pnpm build` | Compiles TypeScript for all workspace packages |
 | `pnpm start` | Builds packages and starts the relay |
-| `pnpm dev` | Runs the development server in parallel |
-| `pnpm chrome` | Launches Chrome with the correct CDP flags |
 
 ---
 
@@ -157,7 +154,7 @@ The WebSocket relay translates incoming JSON payloads from the viewer into the f
 | Type | Payload | CDP Method |
 | :--- | :--- | :--- |
 | `click` | `{x, y}` normalised 0–1 | `Input.dispatchMouseEvent` |
-| `type` | `{value}` single char | `Input.insertText` |
+| `type` | `{value}` string (single char or bulk) | `Runtime.evaluate` → `execCommand('insertText')` |
 | `keydown` | `{key, code, modifiers}` | `Input.dispatchKeyEvent` |
 | `scroll` | `{x, y}` delta | `Input.dispatchMouseEvent` (mouseWheel) |
 | `mousemove` | `{x, y}` normalised 0–1 | `Input.dispatchMouseEvent` |
@@ -169,10 +166,11 @@ The WebSocket relay translates incoming JSON payloads from the viewer into the f
 ```text
 pplx-bridge/
 ├── .github/             # GitHub Actions & issue templates
-├── packages/            # Monorepo packages
-│   └── relay/           # Node.js WebSocket server & CDP client
-├── scripts/             # Bash scripts for setup & launching Chrome
-├── ACTION_PROTOCOL.md   # Documentation for action formatting
+├── packages/
+│   ├── extension/       # Chrome extension (action sender & frame pusher)
+│   ├── relay/           # Node.js WebSocket server & CDP client
+│   └── viewer/          # Static live.html canvas viewer
+├── ACTION_PROTOCOL.md   # Documentation for action payload format
 ├── package.json         # Workspace configuration
 └── pnpm-workspace.yaml  # pnpm workspace definition
 ```

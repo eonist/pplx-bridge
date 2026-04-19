@@ -100,9 +100,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     // Focus the Lexical contenteditable and insert text in one JS call.
     // execCommand('insertText') goes through the browser's native input pipeline
     // (beforeinput -> input events) which React/Lexical/ProseMirror all respond to.
-    // This works for both single chars and full strings.
-    // We explicitly focus [data-lexical-editor] first; if not present, fall back to
-    // any focused/active contenteditable so execCommand has a valid target.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -115,6 +112,18 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
       awaitPromise: false,
     }) as { result: { value: unknown } };
     console.log('[cdp] execCommand result:', result?.result?.value);
+
+    // Tickle Lexical into syncing its EditorState after execCommand.
+    // execCommand writes to the DOM but Lexical's internal state tree may not
+    // reconcile until a real keypress event arrives. Without this, a subsequent
+    // Enter fires into stale state and does nothing. Space+Backspace is invisible
+    // to the user but forces Lexical to process the input event pipeline.
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 });
+    console.log('[cdp] lexical state synced via space+backspace');
     return;
   }
 
@@ -131,8 +140,7 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (special.includes(key) || modifiers) {
       // Re-focus Lexical before Enter so the submit lands in the composer.
       // After execCommand('insertText'), focus can silently drift to <body>;
-      // rawKeyDown for Enter then fires into the void. Explicitly re-focusing
-      // first mirrors what we do in the type handler.
+      // rawKeyDown for Enter then fires into the void.
       if (key === 'Enter' && !modifiers) {
         await send('Runtime.evaluate', {
           expression: `(function() { var el = document.querySelector('[data-lexical-editor="true"]'); if (el) el.focus(); })()`,

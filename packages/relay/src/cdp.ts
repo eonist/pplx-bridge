@@ -96,9 +96,25 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-    // Input.insertText handles both single chars and full strings in one round-trip.
-    // Lexical registers it correctly via the native text insertion path.
-    await send('Input.insertText', { text });
+
+    // Focus the Lexical contenteditable and insert text in one JS call.
+    // execCommand('insertText') goes through the browser's native input pipeline
+    // (beforeinput -> input events) which React/Lexical/ProseMirror all respond to.
+    // This works for both single chars and full strings.
+    // We explicitly focus [data-lexical-editor] first; if not present, fall back to
+    // any focused/active contenteditable so execCommand has a valid target.
+    const result = await send('Runtime.evaluate', {
+      expression: `(function() {
+  var el = document.querySelector('[data-lexical-editor="true"]');
+  if (!el) el = document.activeElement;
+  if (el) { el.focus(); }
+  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
+  return ok;
+})()`,
+      returnByValue: true,
+      awaitPromise: false,
+    }) as { result: { value: unknown } };
+    console.log('[cdp] execCommand result:', result?.result?.value);
     return;
   }
 

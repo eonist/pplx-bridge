@@ -1,6 +1,5 @@
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
- * Connects to Chrome launched with --remote-debugging-port=9222.
  */
 import { WebSocket } from 'ws';
 
@@ -9,28 +8,24 @@ let msgId = 1;
 let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
+let lastClickAt = 0;
 
 export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
   _screenshotCallback = screenshotCallback;
-
   const res = await fetch('http://localhost:9222/json');
-  if (!res.ok) throw new Error('[cdp] Chrome not reachable at localhost:9222. Start Chrome with --remote-debugging-port=9222');
+  if (!res.ok) throw new Error('[cdp] Chrome not reachable at localhost:9222');
   const targets = await res.json() as Array<{ type: string; webSocketDebuggerUrl: string; url: string }>;
-
   const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'))
              ?? targets.find(t => t.type === 'page');
-  if (!page) throw new Error('[cdp] No page target found. Open a tab in Chrome.');
-
+  if (!page) throw new Error('[cdp] No page target found.');
   cdpWs = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
     cdpWs!.once('open', resolve);
-    cdpWs!.once('error', (e) => reject(e));
+    cdpWs!.once('error', reject);
   });
-
   await send('Page.enable', {});
-  await send('Runtime.enable', {});
   await refreshViewport();
-  console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
+  console.log(`[cdp] connected \u2192 ${page.url} (viewport ${vpW}x${vpH})`);
 }
 
 export function isCDPConnected(): boolean {
@@ -39,18 +34,16 @@ export function isCDPConnected(): boolean {
 
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) {
-      return reject(new Error('[cdp] not connected'));
-    }
+    if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) return reject(new Error('[cdp] not connected'));
     const id = msgId++;
-    const onMessage = (data: Buffer) => {
+    const onMsg = (data: Buffer) => {
       let msg: Record<string, unknown>;
       try { msg = JSON.parse(data.toString()); } catch { return; }
       if (msg.id !== id) return;
-      cdpWs!.off('message', onMessage);
+      cdpWs!.off('message', onMsg);
       if (msg.error) reject(msg.error); else resolve(msg.result);
     };
-    cdpWs.on('message', onMessage);
+    cdpWs.on('message', onMsg);
     cdpWs.send(JSON.stringify({ id, method, params }));
   });
 }
@@ -68,49 +61,14 @@ function coords(nx: number, ny: number) {
   return { x: Math.round(nx * vpW), y: Math.round(ny * vpH) };
 }
 
-/**
- * Type text into the focused element.
- *
- * - Single character: use keyDown + char + keyUp sequence.
- *   This fires the full keydown→keypress→input→keyup chain that React/ProseMirror
- *   responds to, one character at a time.
- *
- * - Multi-character string (Comet batches): use clipboard paste.
- *   writeText() + Ctrl+V fires a ClipboardEvent that ProseMirror handles natively.
- */
-async function typeText(text: string): Promise<void> {
-  if (text.length === 1) {
-    // Single char — full key event sequence
-    const key  = text;
-    const code = `Key${text.toUpperCase()}`;
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, text });
-    await send('Input.dispatchKeyEvent', { type: 'char',    key, code, text });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key, code });
-    return;
-  }
-
-  // Multi-char: clipboard paste
-  const escaped = text.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-  const clipResult = await send('Runtime.evaluate', {
-    expression: `navigator.clipboard.writeText(\`${escaped}\`)`,
-    awaitPromise: true,
-    userGesture: true,
-  }) as Record<string, unknown>;
-
-  const clipOk = !(clipResult as any)?.exceptionDetails;
-
-  if (clipOk) {
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'v', code: 'KeyV', modifiers: 2 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'v', code: 'KeyV', modifiers: 2 });
-    console.log('[cdp] paste:', JSON.stringify(text.slice(0, 60)));
-  } else {
-    // Last resort fallback
-    await send('Input.insertText', { text });
-    console.log('[cdp] insertText fallback:', JSON.stringify(text.slice(0, 60)));
-  }
+function keyCode(key: string): number {
+  const map: Record<string, number> = {
+    Enter: 13, Backspace: 8, Tab: 9, Escape: 27,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+    Delete: 46, Home: 36, End: 35,
+  };
+  return map[key] ?? 0;
 }
-
-// ── Input injection ───────────────────────────────────────────────────────────
 
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
@@ -127,39 +85,49 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     await new Promise(r => setTimeout(r, 80));
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
+    lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);
     return;
   }
 
   if (type === 'type') {
-    await typeText(action.value as string);
+    // Comet sends type immediately after click — wait for DOM focus to settle
+    const sinceClick = Date.now() - lastClickAt;
+    if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
+    const text = action.value as string;
+    console.log('[cdp] type:', JSON.stringify(text));
+    // char events work on both <input> and contenteditable (Perplexity uses contenteditable)
+    for (const ch of text) {
+      await send('Input.dispatchKeyEvent', { type: 'char', key: ch, text: ch, unmodifiedText: ch });
+    }
     return;
   }
 
   if (type === 'keydown') {
     const key = action.key as string;
     if (['Meta', 'Shift', 'Control', 'Alt'].includes(key)) return;
-    const code  = (action.code as string) ?? key;
-    const shift = Boolean(action.shiftKey);
-    const ctrl  = Boolean(action.ctrlKey);
-    const meta  = Boolean(action.metaKey);
+    const code      = (action.code as string) ?? key;
+    const shift     = Boolean(action.shiftKey);
+    const ctrl      = Boolean(action.ctrlKey);
+    const meta      = Boolean(action.metaKey);
     const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
+    const vk        = keyCode(key);
+    const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
+    if (special.includes(key) || modifiers) {
+      await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      console.log('[cdp] key:', key, modifiers ? `(modifiers:${modifiers})` : '');
+    }
     return;
   }
 
   if (type === 'scroll') {
     const { x, y } = coords(0.5, 0.5);
-    const deltaX = (action.x as number) * 100;
-    const deltaY = (action.y as number) * 100;
-    await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX, deltaY });
+    await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100 });
     return;
   }
 }
-
-// ── Screenshot loop ───────────────────────────────────────────────────────────
 
 let screenshotInterval = 0;
 
@@ -171,12 +139,8 @@ export function startScreenshots(fps = 1): void {
     busy = true;
     try {
       const result = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };
-      if (_screenshotCallback) {
-        _screenshotCallback(Buffer.from(result.data, 'base64'));
-      }
-    } catch { /* ignore transient errors */ } finally {
-      busy = false;
-    }
+      if (_screenshotCallback) _screenshotCallback(Buffer.from(result.data, 'base64'));
+    } catch { /* ignore */ } finally { busy = false; }
   }, Math.round(1000 / fps)) as unknown as number;
 }
 

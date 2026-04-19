@@ -43,7 +43,7 @@
     resize();
     window.addEventListener('resize', resize);
 
-    // ── Actions WS (viewer → relay → extension) ─────────────────────────
+    // ── Actions WS (viewer → relay → extension) ─────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -52,7 +52,7 @@
         actWs.send(JSON.stringify(action));
     }
 
-    // ── Mouse: click + mousemove (throttled) ─────────────────────────────
+    // ── Mouse: click + mousemove (throttled) ─────────────────────
     canvas.addEventListener('click', (e) => {
       send({
         type: 'click',
@@ -73,16 +73,13 @@
       });
     });
 
-    // ── Scroll ───────────────────────────────────────────────────────────
+    // ── Scroll ───────────────────────────────────────────
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       send({ type: 'scroll', x: e.deltaX, y: e.deltaY });
     }, { passive: false });
 
-    // ── Keyboard ──────────────────────────────────────────────────────────
-    // Send ALL keypresses so typing works in the remote tab.
-    // Printable keys are sent as 'type' with the character value;
-    // special keys (Enter, Backspace, arrows, etc.) as 'keydown'.
+    // ── Keyboard ──────────────────────────────────────────
     document.addEventListener('keydown', (e) => {
       // Don't intercept browser shortcuts
       if (e.metaKey && ['r','l','t','w','n'].includes(e.key.toLowerCase())) return;
@@ -90,7 +87,6 @@
       e.preventDefault();
 
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-        // Printable character — send as incremental type
         send({ type: 'type', value: e.key });
       } else {
         send({
@@ -104,26 +100,17 @@
       }
     });
 
-    // ── Bulk text: capture Comet's beforeinput/input events ───────────────
-    // Comet's driver dispatches bulk text as beforeinput (inputType: "insertText")
-    // rather than individual keydown events. The keydown listener above never
-    // fires for these, so we capture them here and forward as a single type action.
+    // Capture Comet's bulk text — dispatched as beforeinput, not keydown.
+    // Must use capture phase (true) so we fire before Lexical/ProseMirror
+    // calls stopPropagation in the bubble phase.
     document.addEventListener('beforeinput', (e) => {
-      if (e.inputType === 'insertText' && e.data && e.data.length > 1) {
+      if (e.inputType === 'insertText' && e.data && e.data.length > 1 && !e.isComposing) {
         e.preventDefault();
         send({ type: 'type', value: e.data });
       }
-    });
+    }, true);
 
-    // Fallback: input event in case beforeinput is not fired
-    document.addEventListener('input', (e) => {
-      const text = e.data;
-      if (text && text.length > 1) {
-        send({ type: 'type', value: text });
-      }
-    });
-
-    // ── Stream WS (relay → viewer): receive binary JPEG frames ─────────────
+    // ── Stream WS (relay → viewer): receive binary JPEG frames ──────────
     const streamWs = new WebSocket(`ws://localhost:${PORT}/stream`);
     streamWs.binaryType = 'blob';
 

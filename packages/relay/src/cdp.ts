@@ -96,10 +96,17 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const sinceClick = Date.now() - lastClickAt;
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
-    console.log('[cdp] type:', JSON.stringify(text));
-    // char events work on both <input> and contenteditable (Perplexity uses contenteditable)
-    for (const ch of text) {
-      await send('Input.dispatchKeyEvent', { type: 'char', key: ch, text: ch, unmodifiedText: ch });
+    console.log('[cdp] type:', JSON.stringify(text.slice(0, 60)));
+    if (text.length === 1) {
+      // Single char: existing path works fine
+      await send('Input.dispatchKeyEvent', { type: 'char', key: text, text, unmodifiedText: text });
+    } else {
+      // Bulk string: execCommand fires the native input pipeline that
+      // React/ProseMirror/Lexical all respond to — no char loop, no CDP round-trips per char
+      await send('Runtime.evaluate', {
+        expression: `document.execCommand('insertText', false, ${JSON.stringify(text)})`,
+        awaitPromise: false,
+      });
     }
     return;
   }

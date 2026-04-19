@@ -129,6 +129,17 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const vk        = keyCode(key);
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
+      // Re-focus Lexical before Enter so the submit lands in the composer.
+      // After execCommand('insertText'), focus can silently drift to <body>;
+      // rawKeyDown for Enter then fires into the void. Explicitly re-focusing
+      // first mirrors what we do in the type handler.
+      if (key === 'Enter' && !modifiers) {
+        await send('Runtime.evaluate', {
+          expression: `(function() { var el = document.querySelector('[data-lexical-editor="true"]'); if (el) el.focus(); })()`,
+          awaitPromise: false,
+        });
+        await new Promise(r => setTimeout(r, 30));
+      }
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       console.log('[cdp] key:', key, modifiers ? `(modifiers:${modifiers})` : '');

@@ -69,47 +69,44 @@ function coords(nx: number, ny: number) {
 }
 
 /**
- * Type text into the currently focused element.
+ * Type text into the focused element.
  *
- * Uses the keyDown + char + keyUp sequence per character.
- * The 'char' event type dispatches a DOM textInput / beforeinput event
- * that ProseMirror/React contenteditable editors handle natively —
- * no clipboard API needed, works in all Chrome profiles.
+ * - Single character: use keyDown + char + keyUp sequence.
+ *   This fires the full keydown→keypress→input→keyup chain that React/ProseMirror
+ *   responds to, one character at a time.
+ *
+ * - Multi-character string (Comet batches): use clipboard paste.
+ *   writeText() + Ctrl+V fires a ClipboardEvent that ProseMirror handles natively.
  */
 async function typeText(text: string): Promise<void> {
-  for (const ch of text) {
-    // keyDown: lets the editor know a key was pressed (enables modifier handling)
-    await send('Input.dispatchKeyEvent', {
-      type: 'keyDown',
-      key: ch,
-      text: ch,
-      unmodifiedText: ch,
-      code: ch === ' ' ? 'Space' : `Key${ch.toUpperCase()}`,
-      windowsVirtualKeyCode: ch.charCodeAt(0),
-      nativeVirtualKeyCode: ch.charCodeAt(0),
-    });
-    // char: fires textInput / beforeinput — this is what actually inserts the character
-    await send('Input.dispatchKeyEvent', {
-      type: 'char',
-      key: ch,
-      text: ch,
-      unmodifiedText: ch,
-      windowsVirtualKeyCode: ch.charCodeAt(0),
-      nativeVirtualKeyCode: ch.charCodeAt(0),
-    });
-    // keyUp: completes the event cycle
-    await send('Input.dispatchKeyEvent', {
-      type: 'keyUp',
-      key: ch,
-      text: ch,
-      unmodifiedText: ch,
-      code: ch === ' ' ? 'Space' : `Key${ch.toUpperCase()}`,
-      windowsVirtualKeyCode: ch.charCodeAt(0),
-      nativeVirtualKeyCode: ch.charCodeAt(0),
-    });
+  if (text.length === 1) {
+    // Single char — full key event sequence
+    const key  = text;
+    const code = `Key${text.toUpperCase()}`;
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, text });
+    await send('Input.dispatchKeyEvent', { type: 'char',    key, code, text });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key, code });
+    return;
   }
-  if (text.length > 1) {
-    console.log('[cdp] typed:', JSON.stringify(text.slice(0, 60)));
+
+  // Multi-char: clipboard paste
+  const escaped = text.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  const clipResult = await send('Runtime.evaluate', {
+    expression: `navigator.clipboard.writeText(\`${escaped}\`)`,
+    awaitPromise: true,
+    userGesture: true,
+  }) as Record<string, unknown>;
+
+  const clipOk = !(clipResult as any)?.exceptionDetails;
+
+  if (clipOk) {
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'v', code: 'KeyV', modifiers: 2 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'v', code: 'KeyV', modifiers: 2 });
+    console.log('[cdp] paste:', JSON.stringify(text.slice(0, 60)));
+  } else {
+    // Last resort fallback
+    await send('Input.insertText', { text });
+    console.log('[cdp] insertText fallback:', JSON.stringify(text.slice(0, 60)));
   }
 }
 
@@ -143,13 +140,13 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
   if (type === 'keydown') {
     const key = action.key as string;
     if (['Meta', 'Shift', 'Control', 'Alt'].includes(key)) return;
-    const code     = (action.code as string) ?? key;
-    const shift    = Boolean(action.shiftKey);
-    const ctrl     = Boolean(action.ctrlKey);
-    const meta     = Boolean(action.metaKey);
+    const code  = (action.code as string) ?? key;
+    const shift = Boolean(action.shiftKey);
+    const ctrl  = Boolean(action.ctrlKey);
+    const meta  = Boolean(action.metaKey);
     const modifiers = (ctrl ? 2 : 0) | (meta ? 4 : 0) | (shift ? 8 : 0);
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, modifiers });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key, code, modifiers });
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp',   key, code, modifiers, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 });
     return;
   }
 

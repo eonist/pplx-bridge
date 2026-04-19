@@ -14,6 +14,22 @@ Chrome (perplexity.ai)                       Comet (live viewer)
 
 ---
 
+## Prerequisites
+
+> ⚠️ **pplx-bridge only works with Chrome launched in remote debugging mode.** It will not work with a normal Chrome installation.
+
+This project uses the **Chrome DevTools Protocol (CDP)** for everything — screenshots, keyboard/mouse injection, and JavaScript evaluation. CDP is only available when Chrome is started with the `--remote-debugging-port` flag, which exposes a local WebSocket endpoint the relay connects to.
+
+**Without this flag:**
+- The relay cannot connect to Chrome (`connectCDP()` fails immediately)
+- No screenshots can be captured (`Page.captureScreenshot` is CDP-only)
+- No input can be injected (`Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`, `Runtime.evaluate` are all CDP-only)
+- The live viewer will show "disconnected"
+
+**Normal Chrome** (launched from Dock or Spotlight) does not expose CDP and cannot be used with this tool. You must always use the debug launch command in [Step 5](#5-start-chrome-with-remote-debugging).
+
+---
+
 ## 1. Install system dependencies (bare macOS)
 
 ### 1a. Xcode Command Line Tools
@@ -116,7 +132,7 @@ You should see:
 [relay] CDP ready — input + screenshots active
 ```
 
-If you see `[relay] CDP connect failed` — Chrome isn’t running with `--remote-debugging-port=9222`. Go back to step 5.
+If you see `[relay] CDP connect failed` — Chrome isn't running with `--remote-debugging-port=9222`. Go back to step 5.
 
 ---
 
@@ -181,9 +197,9 @@ pnpm start      # build + start relay (requires Chrome already running)
 | `command not found: pnpm` | `corepack enable && corepack prepare pnpm@latest --activate` |
 | `command not found: node` | `brew install node@20` + add to PATH (step 1c) |
 | `EADDRINUSE :::7001` | `lsof -ti :7001 \| xargs kill -9` then retry |
-| `[relay] CDP connect failed` | Chrome isn’t running with `--remote-debugging-port=9222` — re-run step 5 |
-| Viewer shows “disconnected” | Relay not running — run `pnpm start` in the pplx-bridge folder |
-| Viewer shows blank / black | Chrome isn’t on a visible page — click any tab in Chrome |
+| `[relay] CDP connect failed` | Chrome isn't running with `--remote-debugging-port=9222` — re-run step 5 |
+| Viewer shows "disconnected" | Relay not running — run `pnpm start` in the pplx-bridge folder |
+| Viewer shows blank / black | Chrome isn't on a visible page — click any tab in Chrome |
 | Comet Assistant does nothing | Set `localhost` to **Full access** in Comet → Settings → Site access |
 | `ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND` | Run `cd ~/pplx-bridge` first |
 | Login lost after reboot | Use `--user-data-dir=~/.pplx-bridge-profile` (permanent path) |

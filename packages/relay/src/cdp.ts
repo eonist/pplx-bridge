@@ -1,4 +1,3 @@
-
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
  */
@@ -12,6 +11,7 @@ let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
+let _screenshotPausedUntil = 0;
 
 export function setCDPReconnectHandler(handler: () => void): void {
   _reconnectHandler = handler;
@@ -114,6 +114,9 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
+    // Pause screenshots for 400ms so screenshot CDP calls don't interleave
+    // with the move→press→move→release triad and disrupt Blink's hit-test timing.
+    _screenshotPausedUntil = Date.now() + 400;
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved',   x, y, button: 'none', buttons: 0 });
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y, button: 'left', buttons: 1 });
@@ -185,6 +188,9 @@ export function startScreenshots(fps = 1): void {
   let busy = false;
   screenshotInterval = setInterval(async () => {
     if (busy || !isCDPConnected()) return;
+    // Skip screenshot if a click is in flight — avoids CDP message contention
+    // that disrupts Blink's hit-test timing for the click triad.
+    if (Date.now() < _screenshotPausedUntil) return;
     busy = true;
     try {
       const result = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };

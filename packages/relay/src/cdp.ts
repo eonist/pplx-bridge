@@ -9,6 +9,30 @@ let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
+let _reconnectHandler: (() => void) | null = null;
+let _didSignalDisconnect = false;
+
+export function setCDPReconnectHandler(handler: () => void): void {
+  _reconnectHandler = handler;
+}
+
+function signalDisconnect(): void {
+  if (_didSignalDisconnect) return;
+  _didSignalDisconnect = true;
+  cdpWs = null;
+  _reconnectHandler?.();
+}
+
+function attachLifecycle(ws: WebSocket): void {
+  ws.on('close', () => {
+    console.log('[cdp] socket closed');
+    signalDisconnect();
+  });
+  ws.on('error', (err) => {
+    console.error('[cdp] socket error:', (err as Error).message);
+    signalDisconnect();
+  });
+}
 
 export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
   _screenshotCallback = screenshotCallback;
@@ -18,14 +42,17 @@ export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Pr
   const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'))
              ?? targets.find(t => t.type === 'page');
   if (!page) throw new Error('[cdp] No page target found.');
-  cdpWs = new WebSocket(page.webSocketDebuggerUrl);
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
-    cdpWs!.once('open', resolve);
-    cdpWs!.once('error', reject);
+    ws.once('open', resolve);
+    ws.once('error', reject);
   });
+  cdpWs = ws;
+  _didSignalDisconnect = false;
+  attachLifecycle(ws);
   await send('Page.enable', {});
   await refreshViewport();
-  console.log(`[cdp] connected \u2192 ${page.url} (viewport ${vpW}x${vpH})`);
+  console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
 }
 
 export function isCDPConnected(): boolean {
@@ -35,16 +62,21 @@ export function isCDPConnected(): boolean {
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) return reject(new Error('[cdp] not connected'));
+    const ws = cdpWs;
     const id = msgId++;
     const onMsg = (data: Buffer) => {
       let msg: Record<string, unknown>;
       try { msg = JSON.parse(data.toString()); } catch { return; }
       if (msg.id !== id) return;
-      cdpWs!.off('message', onMsg);
+      ws.off('message', onMsg);
       if (msg.error) reject(msg.error); else resolve(msg.result);
     };
-    cdpWs.on('message', onMsg);
-    cdpWs.send(JSON.stringify({ id, method, params }));
+    ws.on('message', onMsg);
+    ws.send(JSON.stringify({ id, method, params }), (err) => {
+      if (!err) return;
+      ws.off('message', onMsg);
+      reject(err);
+    });
   });
 }
 
@@ -96,11 +128,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-
-    // Focus the Lexical contenteditable and insert text via execCommand.
-    // execCommand('insertText') is the only trusted insertion path from a CDP session —
-    // synthetic InputEvent/beforeinput dispatched via Runtime.evaluate have isTrusted:false
-    // which Lexical ignores. Input.insertText is a no-op without OS-level focus.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -128,12 +155,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
       if (key === 'Enter' && !modifiers) {
-        // Sync Lexical EditorState immediately before Enter.
-        // execCommand('insertText') writes to the DOM but Lexical's internal state
-        // tree may not reconcile until a real keypress arrives. A space+backspace
-        // here is invisible to the user but forces Lexical to process the input
-        // event pipeline so the subsequent Enter submit fires correctly.
-        // This is placed on Enter (not on type) so human typing is never affected.
         await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });

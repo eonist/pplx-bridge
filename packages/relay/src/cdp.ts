@@ -102,6 +102,42 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+/**
+ * Suppresses Lexical's DOM selection reconciler for one update cycle.
+ * Lexical's reconciler normally writes EditorState.selection back to the DOM
+ * after every state update (including those triggered by focus/blur events).
+ * By tagging an empty update with SKIP_DOM_SELECTION_TAG before a programmatic
+ * click, we prevent the reconciler from overwriting the native caret position
+ * that the CDP mousePressed event correctly places.
+ *
+ * Ref: https://lexical.dev/docs/concepts/selection
+ * SKIP_DOM_SELECTION_TAG was introduced in Lexical v0.22.0.
+ */
+async function suppressLexicalSelectionReconcile(): Promise<void> {
+  await send('Runtime.evaluate', {
+    expression: `(function() {
+  try {
+    var el = document.querySelector('[data-lexical-editor="true"]');
+    if (!el) return false;
+    var editor = el.__lexicalEditor;
+    if (!editor) return false;
+    // SKIP_DOM_SELECTION_TAG tells Lexical's reconciler to skip writing
+    // EditorState.selection back to the DOM on this update cycle.
+    var SKIP_DOM_SELECTION_TAG = 'skip-dom-selection';
+    editor.update(function() {
+      var tags = editor._updateTags;
+      if (tags) tags.add(SKIP_DOM_SELECTION_TAG);
+    }, { tag: SKIP_DOM_SELECTION_TAG, skipTransforms: true });
+    return true;
+  } catch(e) {
+    return String(e);
+  }
+})()`,
+    returnByValue: true,
+    awaitPromise: false,
+  });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -115,6 +151,9 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const { x, y } = coords(action.x as number, action.y as number);
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
     await new Promise(r => setTimeout(r, 80));
+    // Suppress Lexical's selection reconciler before the click so the native
+    // caret placed by mousePressed is not overwritten by EditorState.selection.
+    await suppressLexicalSelectionReconcile();
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
     lastClickAt = Date.now();

@@ -10,11 +10,17 @@ let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
+let lastTypeAt  = 0; // track when the last type/key action completed
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
 
-// Single persistent message pump — one listener on the socket, id->cb map.
-// Prevents MaxListenersExceededWarning under scroll/click bursts.
+// After a type action, wait this long before allowing a click to fire.
+// Gives Lexical's React reconciliation cycle time to settle so it doesn't
+// overwrite the Blink-placed caret with its stale editorState selection.
+const POST_TYPE_DELAY_MS = 80;
+// After a click, wait this long before allowing a type action to fire.
+const POST_CLICK_DELAY_MS = 150;
+
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
 
 export function setCDPReconnectHandler(handler: () => void): void {
@@ -104,6 +110,10 @@ function coords(nx: number, ny: number) {
 
 function cdpTs(): number { return Date.now() / 1000; }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 function keyCode(key: string): number {
   const map: Record<string, number> = {
     Enter: 13, Backspace: 8, Tab: 9, Escape: 27,
@@ -127,6 +137,13 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
+    // Wait for any in-flight Lexical reconciliation to settle before
+    // mousePressed so the hit-test isn't overwritten by editorState sync.
+    const sinceType = Date.now() - lastTypeAt;
+    if (sinceType < POST_TYPE_DELAY_MS) {
+      await sleep(POST_TYPE_DELAY_MS - sinceType);
+      console.log('[cdp] post-type settle wait', POST_TYPE_DELAY_MS - sinceType, 'ms');
+    }
     await send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',   x, y, button: 'none', buttons: 0,
       pointerType: 'mouse', timestamp: cdpTs(),
@@ -151,11 +168,10 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'type') {
     const sinceClick = Date.now() - lastClickAt;
-    if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
+    if (sinceClick < POST_CLICK_DELAY_MS) await sleep(POST_CLICK_DELAY_MS - sinceClick);
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-    // Do NOT call el.focus() — Lexical's onFocus resets caret to end-of-text,
-    // discarding the position set by the preceding click.
+    // Do NOT call el.focus() — Lexical's onFocus resets caret to end-of-text.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -166,6 +182,7 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
       returnByValue: true,
       awaitPromise: false,
     }) as { result: { value: unknown } };
+    lastTypeAt = Date.now();
     console.log('[cdp] execCommand result:', result?.result?.value);
     return;
   }
@@ -190,6 +207,7 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
       }
       await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
       await send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
+      lastTypeAt = Date.now(); // Backspace/Enter also trigger Lexical reconciliation
       console.log('[cdp] key:', key, modifiers ? `(modifiers:${modifiers})` : '');
     }
     return;

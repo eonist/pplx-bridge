@@ -29,9 +29,12 @@ export async function listTargets(cdpPort = 9222): Promise<CDPTarget[]> {
 
 export class CDPSession {
   readonly cdpPort: number;
+
+  private _targetId  = '';
+  private _targetUrl = '';
   /** Populated after connect() resolves. */
-  readonly targetId: string = '';
-  readonly targetUrl: string = '';
+  get targetId()  { return this._targetId; }
+  get targetUrl() { return this._targetUrl; }
 
   private cdpWs: WebSocket | null = null;
   private msgId = 1;
@@ -62,11 +65,11 @@ export class CDPSession {
 
   private attachLifecycle(ws: WebSocket): void {
     ws.on('close', () => {
-      console.log(`[cdp:${this.cdpPort}/${this.targetId || '?'}] socket closed`);
+      console.log(`[cdp:${this.cdpPort}/${this._targetId || '?'}] socket closed`);
       this.signalDisconnect();
     });
     ws.on('error', (err) => {
-      console.error(`[cdp:${this.cdpPort}/${this.targetId || '?'}] socket error:`, (err as Error).message);
+      console.error(`[cdp:${this.cdpPort}/${this._targetId || '?'}] socket error:`, (err as Error).message);
       this.signalDisconnect();
     });
   }
@@ -100,9 +103,8 @@ export class CDPSession {
     });
     this.cdpWs = ws;
     this.didSignalDisconnect = false;
-    // Store target metadata (readonly workaround via cast)
-    (this as { targetId: string }).targetId = page.id;
-    (this as { targetUrl: string }).targetUrl = page.url;
+    this._targetId  = page.id;
+    this._targetUrl = page.url;
     this.attachLifecycle(ws);
     await this.send('Page.enable', {});
     await this.refreshViewport();
@@ -174,7 +176,7 @@ export class CDPSession {
       await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
       this.lastClickAt = Date.now();
       setTimeout(() => this.refreshViewport(), 600);
-      console.log(`[cdp:${this.cdpPort}/${this.targetId}] click at`, x, y);
+      console.log(`[cdp:${this.cdpPort}/${this._targetId}] click at`, x, y);
       return;
     }
 
@@ -182,7 +184,7 @@ export class CDPSession {
       const sinceClick = Date.now() - this.lastClickAt;
       if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
       const text = action.value as string;
-      console.log(`[cdp:${this.cdpPort}/${this.targetId}] type:`, JSON.stringify(text.slice(0, 80)));
+      console.log(`[cdp:${this.cdpPort}/${this._targetId}] type:`, JSON.stringify(text.slice(0, 80)));
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -194,7 +196,7 @@ export class CDPSession {
         returnByValue: true,
         awaitPromise: false,
       }) as { result: { value: unknown } };
-      console.log(`[cdp:${this.cdpPort}/${this.targetId}] execCommand result:`, result?.result?.value);
+      console.log(`[cdp:${this.cdpPort}/${this._targetId}] execCommand result:`, result?.result?.value);
       return;
     }
 
@@ -218,7 +220,7 @@ export class CDPSession {
         }
         await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
         await this.send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-        console.log(`[cdp:${this.cdpPort}/${this.targetId}] key:`, key, modifiers ? `(modifiers:${modifiers})` : '');
+        console.log(`[cdp:${this.cdpPort}/${this._targetId}] key:`, key, modifiers ? `(modifiers:${modifiers})` : '');
       }
       return;
     }

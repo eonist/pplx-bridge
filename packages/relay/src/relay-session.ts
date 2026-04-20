@@ -31,6 +31,10 @@ export class RelaySession {
   private reconnectDelayMs = RECONNECT_BASE_MS;
   private reconnectInFlight = false;
 
+  // Serial action queue — ensures only one CDP action runs at a time,
+  // preventing rapid click bursts from being seen as double/triple-clicks.
+  private actionChain: Promise<void> = Promise.resolve();
+
   constructor(
     private port: number,
     private cdpPort: number,
@@ -101,7 +105,10 @@ export class RelaySession {
       this.scheduleReconnect();
       return;
     }
-    this.runAction(action).catch((err) => {
+    // Chain onto the serial promise so actions execute one-at-a-time.
+    // This prevents rapid viewer clicks from arriving as double/triple-clicks
+    // in Chrome (which would select text and clobber the caret position).
+    this.actionChain = this.actionChain.then(() => this.runAction(action)).catch((err) => {
       console.error(`[relay:${this.port}] action pipeline error:`, (err as Error).message ?? err);
     });
   }

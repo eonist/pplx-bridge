@@ -59,7 +59,7 @@
     resize();
     window.addEventListener('resize', resize);
 
-    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────
+    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -68,7 +68,7 @@
         actWs.send(JSON.stringify(action));
     }
 
-    // ── Mouse: click + mousemove (throttled) ─────────────────────────
+    // ── Mouse: click + mousemove (throttled) ─────────────────────
     canvas.addEventListener('click', (e) => {
       send({
         type: 'click',
@@ -91,13 +91,13 @@
       });
     });
 
-    // ── Scroll ───────────────────────────────────────────────
+    // ── Scroll ────────────────────────────────────────────
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       send({ type: 'scroll', x: e.deltaX, y: e.deltaY });
     }, { passive: false });
 
-    // ── Proxy: receives Comet's beforeinput / paste ────────────────────
+    // ── Proxy: receives Comet's beforeinput / paste ──────────────────
     // beforeinput fires on contenteditable for both single chars AND bulk strings
     proxy.addEventListener('beforeinput', (e) => {
       e.preventDefault();
@@ -132,12 +132,17 @@
     });
     proxy.focus();
 
-    // ── Keyboard: special keys + shortcuts ──────────────────────────
+    // ── Keyboard: special keys + shortcuts ──────────────────────
     // Single printable chars from human keyboard still come through keydown.
     // Special keys (Enter, Backspace, arrows) and shortcuts are handled here.
+    const MODIFIER_KEYS = new Set(['Meta', 'Shift', 'Control', 'Alt']);
+
     document.addEventListener('keydown', (e) => {
       // Don't intercept browser shortcuts
       if (e.metaKey && ['r','l','t','w','n'].includes(e.key.toLowerCase())) return;
+      // Drop standalone modifier keydowns — they carry no action and
+      // would flush the type buffer before the click that follows them lands.
+      if (MODIFIER_KEYS.has(e.key)) return;
 
       e.preventDefault();
 

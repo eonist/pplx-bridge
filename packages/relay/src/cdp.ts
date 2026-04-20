@@ -204,6 +204,9 @@ export class CDPSession {
       console.log(`[cdp:${this.cdpPort}/${this._targetId}] type:`, JSON.stringify(text.slice(0, 80)));
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
+  var el = document.querySelector('[data-lexical-editor="true"]');
+  if (!el) el = document.activeElement;
+  if (el) { el.focus(); }
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
   return ok;
 })()`,

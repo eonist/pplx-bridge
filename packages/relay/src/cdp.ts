@@ -44,7 +44,7 @@ export class CDPSession {
   private lastClickAt = 0;
   private reconnectHandler: (() => void) | null = null;
   private didSignalDisconnect = false;
-  private screencastActive = false;
+  private screenshotInterval: ReturnType<typeof setInterval> | null = null;
   /** When set, reconnect will re-attach to this specific target ID. */
   private pinnedTargetId: string | undefined;
 
@@ -62,7 +62,6 @@ export class CDPSession {
   private signalDisconnect(): void {
     if (this.didSignalDisconnect) return;
     this.didSignalDisconnect = true;
-    this.screencastActive = false;
     this.cdpWs = null;
     this.reconnectHandler?.();
   }
@@ -205,10 +204,9 @@ export class CDPSession {
       console.log(`[cdp:${this.cdpPort}/${this._targetId}] type:`, JSON.stringify(text.slice(0, 80)));
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
-  var el = document.activeElement;
-  if (!el || el === document.body) {
-    el = document.querySelector('[data-lexical-editor="true"]');
-  }
+  var el = document.querySelector('[data-lexical-editor="true"]');
+  if (!el) el = document.activeElement;
+  if (el) { el.focus(); }
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
   return ok;
 })()`,
@@ -251,46 +249,28 @@ export class CDPSession {
     }
   }
 
-  private screencastFrameHandler: ((params: Record<string, unknown>) => void) | null = null;
-
   startScreenshots(fps = 5): void {
-    if (this.screencastActive) return;
-    this.screencastActive = true;
-
-    this.screencastFrameHandler = (params) => {
-      const { data, sessionId } = params as { data: string; sessionId: number };
-      if (this.screenshotCallback) {
-        this.screenshotCallback(Buffer.from(data, 'base64'));
-      }
-      this.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
-    };
-
-    this.cdpOn('Page.screencastFrame', this.screencastFrameHandler);
-
-    this.send('Page.startScreencast', {
-      format:        'jpeg',
-      quality:       60,
-      maxWidth:      this.vpW,
-      maxHeight:     this.vpH,
-      everyNthFrame: Math.max(1, Math.round(30 / fps)),
-    }).catch((err) => {
-      console.error(`[cdp:${this.cdpPort}/${this._targetId}] startScreencast error:`, (err as Error).message);
-      this.screencastActive = false;
-    });
-
-    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screencast started (target ~${fps}fps)`);
+    if (this.screenshotInterval) return;
+    let busy = false;
+    this.screenshotInterval = setInterval(async () => {
+      if (busy || !this.isConnected()) return;
+      busy = true;
+      try {
+        const result = await this.send('Page.captureScreenshot', {
+          format: 'jpeg',
+          quality: 60,
+          fromSurface: true,
+        }) as { data: string };
+        if (this.screenshotCallback) this.screenshotCallback(Buffer.from(result.data, 'base64'));
+      } catch { /* ignore */ } finally { busy = false; }
+    }, Math.round(1000 / fps));
+    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screenshot polling started (~${fps}fps)`);
   }
 
   stopScreenshots(): void {
-    if (!this.screencastActive) return;
-    this.screencastActive = false;
-
-    if (this.screencastFrameHandler) {
-      this.cdpOff('Page.screencastFrame', this.screencastFrameHandler);
-      this.screencastFrameHandler = null;
-    }
-
-    this.send('Page.stopScreencast', {}).catch(() => {});
-    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screencast stopped`);
+    if (!this.screenshotInterval) return;
+    clearInterval(this.screenshotInterval);
+    this.screenshotInterval = null;
+    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screenshot polling stopped`);
   }
 }

@@ -98,12 +98,6 @@ export class CDPSession {
     this.eventListeners.get(method)?.delete(handler);
   }
 
-  /**
-   * Connect to a Chrome tab.
-   * @param screenshotCallback  Called for each captured JPEG frame.
-   * @param targetId            Optional CDP target ID. If omitted, picks the
-   *                            first perplexity.ai page (or first page).
-   */
   async connect(screenshotCallback: (jpeg: Buffer) => void, targetId?: string): Promise<void> {
     this.screenshotCallback = screenshotCallback;
     if (targetId) this.pinnedTargetId = targetId;
@@ -211,9 +205,11 @@ export class CDPSession {
       console.log(`[cdp:${this.cdpPort}/${this._targetId}] type:`, JSON.stringify(text.slice(0, 80)));
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
-  var el = document.querySelector('[data-lexical-editor="true"]');
-  if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
+  var el = document.activeElement;
+  if (!el || el === document.body) {
+    el = document.querySelector('[data-lexical-editor="true"]');
+    if (el) el.focus();
+  }
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
   return ok;
 })()`,
@@ -256,17 +252,8 @@ export class CDPSession {
     }
   }
 
-  // Screencast frame handler — kept as instance property so we can remove it on stop
   private screencastFrameHandler: ((params: Record<string, unknown>) => void) | null = null;
 
-  /**
-   * Start streaming frames via Page.startScreencast.
-   * Replaces the old captureScreenshot polling — works correctly for
-   * background tabs because Chrome delivers screencast frames per-target
-   * regardless of which tab is focused.
-   *
-   * @param fps  Target frame rate (Chrome honours this only approximately).
-   */
   startScreenshots(fps = 5): void {
     if (this.screencastActive) return;
     this.screencastActive = true;
@@ -276,7 +263,6 @@ export class CDPSession {
       if (this.screenshotCallback) {
         this.screenshotCallback(Buffer.from(data, 'base64'));
       }
-      // Ack the frame so Chrome sends the next one
       this.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
     };
 
@@ -287,7 +273,7 @@ export class CDPSession {
       quality:       60,
       maxWidth:      this.vpW,
       maxHeight:     this.vpH,
-      everyNthFrame: Math.max(1, Math.round(30 / fps)), // Chrome captures at ~30fps internally
+      everyNthFrame: Math.max(1, Math.round(30 / fps)),
     }).catch((err) => {
       console.error(`[cdp:${this.cdpPort}/${this._targetId}] startScreencast error:`, (err as Error).message);
       this.screencastActive = false;

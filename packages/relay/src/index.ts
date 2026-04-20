@@ -95,6 +95,12 @@ let reconnectDelayMs = RECONNECT_BASE_MS;
 let reconnectInFlight = false;
 const queuedActions: QueuedAction[] = [];
 
+// Serial promise chain — ensures only one CDP action executes at a time.
+// Without this, rapid viewer clicks arrive faster than the 80ms mousedown
+// settle delay and Chrome interprets back-to-back clicks as double/triple-
+// clicks, which select text and clobber the caret position.
+let actionChain: Promise<void> = Promise.resolve();
+
 function pruneQueuedActions(): void {
   const now = Date.now();
   while (queuedActions.length && queuedActions[0]!.expiresAt <= now) queuedActions.shift();
@@ -126,7 +132,7 @@ function enqueueOrRunAction(action: Record<string, unknown>): void {
     scheduleReconnect();
     return;
   }
-  runAction(action).catch((err) => {
+  actionChain = actionChain.then(() => runAction(action)).catch((err) => {
     console.error('[relay] action pipeline error:', (err as Error).message ?? err);
   });
 }
@@ -150,7 +156,6 @@ async function reconnectCDP(): Promise<void> {
     startScreenshots(SCREENSHOT_FPS);
     console.log('[relay] CDP reconnected');
     await flushQueuedActions();
-    // Reset backoff only after flush succeeds — so a bad-flush loop stays throttled
     reconnectDelayMs = RECONNECT_BASE_MS;
   } catch (err) {
     console.error('[relay] reconnect failed:', (err as Error).message);
@@ -173,7 +178,6 @@ function scheduleReconnect(): void {
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
-// stopScreenshots is handled inside reconnectCDP; no need to call it here too
 setCDPReconnectHandler(() => {
   scheduleReconnect();
 });
@@ -232,8 +236,12 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        const buffered = flushTypeBuffer();
-        if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
+        // Don't flush type buffer on click/mousemove — the click sets its own
+        // caret position; flushing first would race the type against the click.
+        if (parsed.type !== 'mousemove' && parsed.type !== 'click') {
+          const buffered = flushTypeBuffer();
+          if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
+        }
 
         if (parsed.type !== 'mousemove') {
           console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));

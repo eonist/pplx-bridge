@@ -74,8 +74,6 @@ function flushTypeBuffer(): void {
 }
 
 // ── Cmd+V paste intercept ─────────────────────────────────────────
-// CDP Input.dispatchKeyEvent for Cmd+V cannot access the macOS pasteboard.
-// Instead: read clipboard with pbpaste and inject via Input.insertText.
 function handlePaste(): void {
   try {
     const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
@@ -121,7 +119,6 @@ wss.on('connection', (ws, req) => {
       if (!isReceiver) {
         if (!parsed) return;
 
-        // Intercept Cmd+V: read macOS clipboard and inject as insertText
         if (
           parsed.type === 'keydown' &&
           parsed.key === 'v' &&
@@ -133,7 +130,6 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Buffer rapid single-char type actions
         if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
           typeBuffer += parsed.value as string;
           if (typeTimer) clearTimeout(typeTimer);
@@ -141,7 +137,6 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Flush buffer before any other action
         flushTypeBuffer();
         if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
 
@@ -160,6 +155,22 @@ wss.on('connection', (ws, req) => {
   }
 });
 
+// ── Startup CDP connect with fallback into reconnect loop ─────────────
+async function startCDP(): Promise<void> {
+  try {
+    await connectCDP(broadcastFrame);
+    // startScreenshots is now called inside connectCDP on every (re)connect
+    console.log('[relay] CDP ready — input + screenshots active\n');
+  } catch (err) {
+    console.error('[relay] CDP connect failed:', (err as Error).message);
+    console.log('[relay] Waiting for Chrome — will retry automatically\n');
+    // connectCDP stores the callback; scheduleReconnect is triggered internally
+    // by cdp.ts close/error handlers. For the initial failure we manually
+    // kick off a retry by attempting connectCDP again after a delay.
+    setTimeout(() => startCDP(), 3000);
+  }
+}
+
 server.listen(PORT, async () => {
   const w = 44;
   console.log(`\n╔${'═'.repeat(w)}╗`);
@@ -175,12 +186,5 @@ server.listen(PORT, async () => {
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
-  try {
-    await connectCDP(broadcastFrame);
-    startScreenshots(5);
-    console.log('[relay] CDP ready — input + screenshots active\n');
-  } catch (err) {
-    console.error('[relay] CDP connect failed:', (err as Error).message);
-    console.error('[relay] Start Chrome with --remote-debugging-port=9222 and restart relay\n');
-  }
+  await startCDP();
 });

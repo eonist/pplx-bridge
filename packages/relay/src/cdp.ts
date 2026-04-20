@@ -1,5 +1,6 @@
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
+ * Includes automatic reconnection with exponential backoff (issue #71).
  */
 import { WebSocket } from 'ws';
 
@@ -9,6 +10,30 @@ let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
+let _reconnecting = false;
+let _reconnectDelay = 1000;
+const MAX_RECONNECT_DELAY = 15000;
+
+// ── Reconnect loop ───────────────────────────────────────────────────────────
+
+function scheduleReconnect(): void {
+  if (_reconnecting) return;
+  _reconnecting = true;
+  console.log(`[cdp] disconnected — reconnecting in ${_reconnectDelay / 1000}s…`);
+  setTimeout(async () => {
+    _reconnecting = false;
+    if (!_screenshotCallback) return;
+    try {
+      await connectCDP(_screenshotCallback);
+      _reconnectDelay = 1000; // reset on success
+    } catch {
+      _reconnectDelay = Math.min(_reconnectDelay * 2, MAX_RECONNECT_DELAY);
+      scheduleReconnect();
+    }
+  }, _reconnectDelay);
+}
+
+// ── Connect ──────────────────────────────────────────────────────────────────
 
 export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
   _screenshotCallback = screenshotCallback;
@@ -23,9 +48,24 @@ export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Pr
     cdpWs!.once('open', resolve);
     cdpWs!.once('error', reject);
   });
+
+  // Attach resilience handlers
+  cdpWs.on('close', () => {
+    console.log('[cdp] WebSocket closed');
+    cdpWs = null;
+    stopScreenshots();
+    scheduleReconnect();
+  });
+  cdpWs.on('error', (err) => {
+    console.error('[cdp] WebSocket error:', (err as Error).message);
+  });
+
   await send('Page.enable', {});
   await refreshViewport();
-  console.log(`[cdp] connected \u2192 ${page.url} (viewport ${vpW}x${vpH})`);
+  console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
+
+  // Resume screenshots if they were running before a reconnect
+  startScreenshots(5);
 }
 
 export function isCDPConnected(): boolean {
@@ -97,10 +137,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
 
-    // Focus the Lexical contenteditable and insert text via execCommand.
-    // execCommand('insertText') is the only trusted insertion path from a CDP session —
-    // synthetic InputEvent/beforeinput dispatched via Runtime.evaluate have isTrusted:false
-    // which Lexical ignores. Input.insertText is a no-op without OS-level focus.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -128,12 +164,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
       if (key === 'Enter' && !modifiers) {
-        // Sync Lexical EditorState immediately before Enter.
-        // execCommand('insertText') writes to the DOM but Lexical's internal state
-        // tree may not reconcile until a real keypress arrives. A space+backspace
-        // here is invisible to the user but forces Lexical to process the input
-        // event pipeline so the subsequent Enter submit fires correctly.
-        // This is placed on Enter (not on type) so human typing is never affected.
         await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });
@@ -160,7 +190,8 @@ export function startScreenshots(fps = 1): void {
   if (screenshotInterval) return;
   let busy = false;
   screenshotInterval = setInterval(async () => {
-    if (busy || !isCDPConnected()) return;
+    if (busy) return;
+    if (!isCDPConnected()) return; // reconnect is handled by close handler
     busy = true;
     try {
       const result = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };

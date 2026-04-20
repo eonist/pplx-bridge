@@ -6,8 +6,8 @@
     "build":  "pnpm -r build",
     "dev":    "pnpm -r --parallel dev",
     "check":  "bash scripts/check-prereqs.sh",
-    "start":  "pnpm build && node packages/relay/dist/index.js",
-    "relay":  "node packages/relay/dist/index.js",
+    "start":  "pnpm build && node packages/relay/dist/main.js",
+    "relay":  "node packages/relay/dist/main.js",
     "chrome": "bash scripts/launch-chrome.sh"
   },
   "devDependencies": {

@@ -147,10 +147,11 @@ async function reconnectCDP(): Promise<void> {
   try {
     console.log('[relay] reconnecting CDP...');
     await connectCDP(broadcastFrame);
-    reconnectDelayMs = RECONNECT_BASE_MS;
     startScreenshots(SCREENSHOT_FPS);
     console.log('[relay] CDP reconnected');
     await flushQueuedActions();
+    // Reset backoff only after flush succeeds — so a bad-flush loop stays throttled
+    reconnectDelayMs = RECONNECT_BASE_MS;
   } catch (err) {
     console.error('[relay] reconnect failed:', (err as Error).message);
     scheduleReconnect();
@@ -172,8 +173,8 @@ function scheduleReconnect(): void {
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
+// stopScreenshots is handled inside reconnectCDP; no need to call it here too
 setCDPReconnectHandler(() => {
-  stopScreenshots();
   scheduleReconnect();
 });
 

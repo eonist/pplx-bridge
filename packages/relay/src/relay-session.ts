@@ -264,8 +264,13 @@ export class RelaySession {
               return;
             }
 
-            const buffered = this.flushTypeBuffer();
-            if (buffered) this.enqueueOrRunAction({ type: 'type', value: buffered });
+            // Don't flush the type buffer on click/mousemove — a click sets its own
+            // caret position. Flushing before the click would call el.focus() in the
+            // type handler, resetting the caret to end before the click lands.
+            if (parsed.type !== 'mousemove' && parsed.type !== 'click') {
+              const buffered = this.flushTypeBuffer();
+              if (buffered) this.enqueueOrRunAction({ type: 'type', value: buffered });
+            }
 
             if (parsed.type !== 'mousemove') {
               console.log(`[relay:${this.port}] action →`, JSON.stringify(parsed).slice(0, 120));

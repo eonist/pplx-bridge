@@ -59,21 +59,6 @@ function broadcastFrame(jpeg: Buffer): void {
   }
 }
 
-let typeBuffer = '';
-let typeTimer: ReturnType<typeof setTimeout> | null = null;
-
-function flushTypeBuffer(): string {
-  if (!typeBuffer) return '';
-  const text = typeBuffer;
-  typeBuffer = '';
-  if (typeTimer) {
-    clearTimeout(typeTimer);
-    typeTimer = null;
-  }
-  console.log('[relay] flush type:', JSON.stringify(text.slice(0, 80)));
-  return text;
-}
-
 function handlePaste(): void {
   try {
     const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
@@ -95,9 +80,6 @@ let reconnectDelayMs = RECONNECT_BASE_MS;
 let reconnectInFlight = false;
 const queuedActions: QueuedAction[] = [];
 
-// Single-worker FIFO for live actions. Ensures only one handleAction()
-// runs at a time so CDP mouseMoved/mousePressed/mouseReleased triplets
-// never interleave across concurrent clicks.
 const liveQueue: Record<string, unknown>[] = [];
 let liveWorkerRunning = false;
 
@@ -239,25 +221,10 @@ wss.on('connection', (ws, req) => {
           parsed.key === 'v' &&
           parsed.metaKey === true
         ) {
-          const buffered = flushTypeBuffer();
-          if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
           console.log('[relay] action → Cmd+V (intercepted as paste)');
           handlePaste();
           return;
         }
-
-        if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
-          typeBuffer += parsed.value as string;
-          if (typeTimer) clearTimeout(typeTimer);
-          typeTimer = setTimeout(() => {
-            const buffered = flushTypeBuffer();
-            if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
-          }, 200);
-          return;
-        }
-
-        const buffered = flushTypeBuffer();
-        if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
 
         if (parsed.type !== 'mousemove') {
           console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));

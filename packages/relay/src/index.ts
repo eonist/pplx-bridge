@@ -216,6 +216,7 @@ wss.on('connection', (ws, req) => {
       if (!isReceiver) {
         if (!parsed) return;
 
+        // Intercept Cmd+V as paste — read from macOS clipboard via pbpaste
         if (
           parsed.type === 'keydown' &&
           parsed.key === 'v' &&

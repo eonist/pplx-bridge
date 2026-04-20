@@ -43,13 +43,13 @@
   </div>
 
   <script>
-    const PORT   = 7001;
+    // Derive relay port from the URL this page was served from.
+    const PORT   = parseInt(window.location.port, 10) || 7001;
     const canvas = document.getElementById('screen');
     const ctx    = canvas.getContext('2d');
     const status = document.getElementById('status');
     const proxy  = document.getElementById('inputProxy');
 
-    // Match canvas resolution to display
     function resize() {
       canvas.width  = window.innerWidth;
       canvas.height = window.innerHeight;
@@ -57,7 +57,7 @@
     resize();
     window.addEventListener('resize', resize);
 
-    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────
+    // ── Actions WS (viewer → relay → CDP) ─────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -66,7 +66,7 @@
         actWs.send(JSON.stringify(action));
     }
 
-    // ── Mouse: click + mousemove (throttled) ─────────────────────────
+    // ── Mouse: click + mousemove (throttled) ─────────────────
     canvas.addEventListener('click', (e) => {
       send({
         type: 'click',
@@ -89,14 +89,13 @@
       });
     });
 
-    // ── Scroll ───────────────────────────────────────────────
+    // ── Scroll ──────────────────────────────────
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       send({ type: 'scroll', x: e.deltaX, y: e.deltaY });
     }, { passive: false });
 
-    // ── Proxy: receives Comet's beforeinput / paste ────────────────────
-    // beforeinput fires on contenteditable for both single chars AND bulk strings
+    // ── Proxy: receives Comet's beforeinput / paste ──────────────────
     proxy.addEventListener('beforeinput', (e) => {
       e.preventDefault();
       if (e.inputType === 'insertText' && e.data && !e.isComposing) {
@@ -108,7 +107,6 @@
       }
     });
 
-    // Drain any text that slips into the proxy DOM
     proxy.addEventListener('input', () => {
       if (proxy.textContent) {
         const v = proxy.textContent;
@@ -117,30 +115,28 @@
       }
     });
 
-    // Handle paste into proxy
     proxy.addEventListener('paste', (e) => {
       e.preventDefault();
       const text = e.clipboardData.getData('text');
       if (text) send({ type: 'type', value: text });
     });
 
-    // Keep proxy focused when focus drifts to body
     document.addEventListener('focusout', () => {
       setTimeout(() => { if (document.activeElement === document.body) proxy.focus(); }, 0);
     });
     proxy.focus();
 
-    // ── Keyboard: special keys + shortcuts ──────────────────────────
-    // Single printable chars from human keyboard still come through keydown.
-    // Special keys (Enter, Backspace, arrows) and shortcuts are handled here.
+    // ── Keyboard: special keys + shortcuts ──────────────────────
     document.addEventListener('keydown', (e) => {
       // Don't intercept browser shortcuts
       if (e.metaKey && ['r','l','t','w','n'].includes(e.key.toLowerCase())) return;
 
+      // Skip modifier-only keydowns — noise that causes spurious relay actions
+      if (['Meta', 'Shift', 'Control', 'Alt'].includes(e.key)) return;
+
       e.preventDefault();
 
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-        // Printable char from human typing — proxy's beforeinput handles Comet's chars
         send({ type: 'type', value: e.key });
       } else {
         send({

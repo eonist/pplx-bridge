@@ -128,11 +128,13 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
+    // Do NOT call el.focus() here — on Lexical editors, programmatic .focus()
+    // from Runtime.evaluate fires Lexical's onFocus handler which resets the
+    // selection state and clobbers the caret position set by the prior click.
+    // On native inputs (e.g. google.com) this was harmless, but on Lexical it
+    // is the root cause of the caret-steal bug. Trust document.activeElement.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
-  var el = document.querySelector('[data-lexical-editor="true"]');
-  if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
   return ok;
 })()`,

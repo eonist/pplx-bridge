@@ -23,6 +23,7 @@ type QueuedAction = {
 export class RelaySession {
   private cdp: CDPSession;
   private streamViewers = new Set<WebSocket>();
+  private pushers = new Set<WebSocket>();         // extension /stream/push senders
   private typeBuffer = '';
   private typeTimer: ReturnType<typeof setTimeout> | null = null;
   private queuedActions: QueuedAction[] = [];
@@ -30,20 +31,12 @@ export class RelaySession {
   private reconnectDelayMs = RECONNECT_BASE_MS;
   private reconnectInFlight = false;
 
-  /**
-   * @param port       Relay HTTP/WS port.
-   * @param cdpPort    Chrome remote debugging port.
-   * @param targetId   Optional CDP target ID. When provided, this session is
-   *                   pinned to a specific Chrome tab. Omit for single-session
-   *                   use (picks the first perplexity.ai tab).
-   */
   constructor(
     private port: number,
     private cdpPort: number,
     private targetId?: string,
   ) {
     this.cdp = new CDPSession(cdpPort);
-    // stopScreenshots is handled inside reconnectCDP; no need to call it in the handler too
     this.cdp.setReconnectHandler(() => this.scheduleReconnect());
   }
 
@@ -129,10 +122,12 @@ export class RelaySession {
     try {
       console.log(`[relay:${this.port}] reconnecting CDP...`);
       await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg), this.targetId);
-      this.cdp.startScreenshots(SCREENSHOT_FPS);
+      // Only start CDP screencast if no extension pushers are connected
+      if (this.pushers.size === 0) {
+        this.cdp.startScreenshots(SCREENSHOT_FPS);
+      }
       console.log(`[relay:${this.port}] CDP reconnected`);
       await this.flushQueuedActions();
-      // Reset backoff only after flush succeeds — so a bad-flush loop stays throttled
       this.reconnectDelayMs = RECONNECT_BASE_MS;
     } catch (err) {
       console.error(`[relay:${this.port}] reconnect failed:`, (err as Error).message);
@@ -200,9 +195,28 @@ export class RelaySession {
       const url = req.url ?? '';
 
       if (url === '/stream/push') {
-        console.log(`[relay:${this.port}] ▲ streamer connected (CDP mode ignores this)`);
-        ws.on('message', () => {});
-        ws.on('close', () => console.log(`[relay:${this.port}] ▼ streamer disconnected`));
+        // Extension frame pusher — preferred over CDP screencast
+        this.pushers.add(ws);
+        console.log(`[relay:${this.port}] ▲ extension pusher connected (total: ${this.pushers.size}) — pausing CDP screencast`);
+        // Stop CDP screencast while extension is pushing frames (avoids dual render)
+        if (this.cdp.isConnected()) this.cdp.stopScreenshots();
+
+        ws.on('message', (data) => {
+          // Forward raw JPEG binary from extension to all stream viewers
+          const buf = data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
+          for (const v of this.streamViewers) {
+            if (v.readyState === WebSocket.OPEN) v.send(buf, { binary: true });
+          }
+        });
+
+        ws.on('close', () => {
+          this.pushers.delete(ws);
+          console.log(`[relay:${this.port}] ▼ extension pusher disconnected — resuming CDP screencast`);
+          // Resume CDP screencast when extension disconnects
+          if (this.cdp.isConnected() && this.pushers.size === 0) {
+            this.cdp.startScreenshots(SCREENSHOT_FPS);
+          }
+        });
 
       } else if (url === '/stream') {
         this.streamViewers.add(ws);
@@ -221,7 +235,7 @@ export class RelaySession {
 
           if (parsed?.register === 'extension') {
             isReceiver = true;
-            console.log(`[relay:${this.port}] ▲ action-receiver (ext) connected — CDP mode: extension ignored for input`);
+            console.log(`[relay:${this.port}] ▲ action-receiver (ext) connected`);
             return;
           }
 
@@ -284,8 +298,11 @@ export class RelaySession {
       try {
         await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg), this.targetId);
         this.reconnectDelayMs = RECONNECT_BASE_MS;
-        this.cdp.startScreenshots(SCREENSHOT_FPS);
-        console.log(`[relay:${this.port}] CDP ready — input + screenshots active\n`);
+        // Start CDP screencast only if no extension pusher is already connected
+        if (this.pushers.size === 0) {
+          this.cdp.startScreenshots(SCREENSHOT_FPS);
+        }
+        console.log(`[relay:${this.port}] CDP ready — input active, screencast ${ this.pushers.size > 0 ? 'deferred (extension pushing)' : 'active' }\n`);
       } catch (err) {
         console.error(`[relay:${this.port}] CDP connect failed:`, (err as Error).message);
         this.scheduleReconnect();

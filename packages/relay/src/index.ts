@@ -9,6 +9,7 @@ import { connectCDP, handleAction, startScreenshots, stopScreenshots, isCDPConne
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT ?? 7001);
+const CDP_PORT = Number(process.env.CDP_PORT ?? 9222);
 const SCREENSHOT_FPS = 5;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
@@ -47,7 +48,7 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPConnected() }));
+app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdpPort: CDP_PORT, cdp: isCDPConnected() }));
 
 const wss = new WebSocketServer({ server });
 const streamViewers = new Set<WebSocket>();
@@ -259,7 +260,7 @@ server.listen(PORT, async () => {
   console.log(`  Health       http://localhost:${PORT}/health\n`);
   console.log(`  ⚠️  Start Chrome with:`);
   console.log(`     /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\`);
-  console.log(`       --remote-debugging-port=9222 \\`);
+  console.log(`       --remote-debugging-port=${CDP_PORT} \\`);
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
@@ -270,7 +271,7 @@ server.listen(PORT, async () => {
     console.log('[relay] CDP ready — input + screenshots active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);
-    console.error('[relay] Start Chrome with --remote-debugging-port=9222 and restart relay\n');
+    console.error(`[relay] Start Chrome with --remote-debugging-port=${CDP_PORT} and restart relay\n`);
     scheduleReconnect();
   }
 });

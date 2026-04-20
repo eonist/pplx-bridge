@@ -3,6 +3,8 @@
  */
 import { WebSocket } from 'ws';
 
+const CDP_PORT = Number(process.env.CDP_PORT ?? 9222);
+
 let cdpWs: WebSocket | null = null;
 let msgId = 1;
 let vpW = 1280;
@@ -36,8 +38,8 @@ function attachLifecycle(ws: WebSocket): void {
 
 export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
   _screenshotCallback = screenshotCallback;
-  const res = await fetch('http://localhost:9222/json');
-  if (!res.ok) throw new Error('[cdp] Chrome not reachable at localhost:9222');
+  const res = await fetch(`http://localhost:${CDP_PORT}/json`);
+  if (!res.ok) throw new Error(`[cdp] Chrome not reachable at localhost:${CDP_PORT}`);
   const targets = await res.json() as Array<{ type: string; webSocketDebuggerUrl: string; url: string }>;
   const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'))
              ?? targets.find(t => t.type === 'page');

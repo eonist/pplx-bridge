@@ -43,7 +43,9 @@
   </div>
 
   <script>
-    const PORT   = 7001;
+    // Derive relay port from the URL this page was served from so that
+    // localhost:7002/live connects to :7002, not the hardcoded :7001.
+    const PORT   = parseInt(window.location.port, 10) || 7001;
     const canvas = document.getElementById('screen');
     const ctx    = canvas.getContext('2d');
     const status = document.getElementById('status');

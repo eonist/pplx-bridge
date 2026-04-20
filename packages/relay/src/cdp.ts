@@ -1,3 +1,4 @@
+
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
  */
@@ -107,15 +108,22 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'mousemove') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
     return;
   }
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
-    await new Promise(r => setTimeout(r, 80));
+    // Puppeteer / Playwright industry-standard triad: move → press → release
+    // at identical coordinates. The initial mouseMoved seeds Blink's
+    // last-known mouse position, which contenteditable / Lexical use to
+    // resolve the caret anchor on mousedown. Without it, the caret falls
+    // back to the previous position (the "jumps to end" regression).
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved',   x, y, button: 'none', buttons: 0 });
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
+    // Refresh last-known position while the button is held so the up
+    // event also hit-tests at (x, y) rather than a cached coord.
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y, button: 'left', buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
     lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);

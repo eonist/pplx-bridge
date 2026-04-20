@@ -111,6 +111,33 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+// After CDP move/press/release, dispatch synthetic pointer+mouse events
+// directly into the page so Lexical's own mousedown handler fires with
+// the correct clientX/clientY. Lexical reconciles its editorState
+// selection from the DOM after mousedown; without this, a concurrent
+// React reconciliation can overwrite the Blink-placed caret with the
+// last editorState selection (end-of-text after focus-restore).
+async function dispatchSyntheticClick(x: number, y: number): Promise<void> {
+  await send('Runtime.evaluate', {
+    expression: `(function() {
+  var el = document.elementFromPoint(${x}, ${y});
+  if (!el) return;
+  var init = {
+    bubbles: true, cancelable: true, view: window,
+    clientX: ${x}, clientY: ${y},
+    screenX: ${x}, screenY: ${y},
+    buttons: 1, button: 0
+  };
+  el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, init, { pointerId: 1, pointerType: 'mouse', isPrimary: true })));
+  el.dispatchEvent(new MouseEvent('mousedown', init));
+  el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, init, { buttons: 0 })));
+  el.dispatchEvent(new MouseEvent('click', Object.assign({}, init, { buttons: 0 })));
+})()`,
+    returnByValue: false,
+    awaitPromise: false,
+  });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -125,6 +152,7 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
+    // Step 1: CDP move/press/release — Blink places caret via hit-test.
     await send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',    x, y, button: 'none', buttons: 0,
       pointerType: 'mouse',  timestamp: cdpTs(),
@@ -137,6 +165,10 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
       type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
       pointerType: 'mouse',  timestamp: cdpTs(),
     });
+    // Step 2: Synthetic JS events so Lexical's mousedown handler fires
+    // with correct coords and adopts the Blink-placed caret into its
+    // editorState, preventing it from reconciling backwards to end-of-text.
+    await dispatchSyntheticClick(x, y);
     lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);
@@ -148,12 +180,7 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-    // IMPORTANT: do NOT .focus() the editor by selector. Lexical's
-    // focus() restores its last known selection (end of text), which
-    // overrides the caret we just placed via mouseclick and causes
-    // subsequent clicks to land at end-of-text. Use whatever element
-    // already has focus; if nothing does, skip silently so we never
-    // steal focus away from a freshly-placed caret.
+    // Do NOT focus by selector — Lexical.focus() restores end-of-text selection.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.activeElement;

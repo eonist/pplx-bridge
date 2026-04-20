@@ -13,6 +13,11 @@ let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
 
+// Single persistent message pump + pending-call map. Prevents the
+// EventEmitter listener leak we hit under scroll/click bursts, and
+// guarantees in-order delivery of replies regardless of call volume.
+const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+
 export function setCDPReconnectHandler(handler: () => void): void {
   _reconnectHandler = handler;
 }
@@ -21,10 +26,22 @@ function signalDisconnect(): void {
   if (_didSignalDisconnect) return;
   _didSignalDisconnect = true;
   cdpWs = null;
+  for (const { reject } of pending.values()) reject(new Error('[cdp] disconnected'));
+  pending.clear();
   _reconnectHandler?.();
 }
 
 function attachLifecycle(ws: WebSocket): void {
+  ws.on('message', (data: Buffer) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    const id = msg.id as number | undefined;
+    if (id == null) return; // CDP event, not a reply — ignore
+    const cb = pending.get(id);
+    if (!cb) return;
+    pending.delete(id);
+    if (msg.error) cb.reject(msg.error); else cb.resolve(msg.result);
+  });
   ws.on('close', () => {
     console.log('[cdp] socket closed');
     signalDisconnect();
@@ -63,19 +80,11 @@ export function isCDPConnected(): boolean {
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) return reject(new Error('[cdp] not connected'));
-    const ws = cdpWs;
     const id = msgId++;
-    const onMsg = (data: Buffer) => {
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.id !== id) return;
-      ws.off('message', onMsg);
-      if (msg.error) reject(msg.error); else resolve(msg.result);
-    };
-    ws.on('message', onMsg);
-    ws.send(JSON.stringify({ id, method, params }), (err) => {
+    pending.set(id, { resolve, reject });
+    cdpWs.send(JSON.stringify({ id, method, params }), (err) => {
       if (!err) return;
-      ws.off('message', onMsg);
+      pending.delete(id);
       reject(err);
     });
   });
@@ -94,6 +103,10 @@ function coords(nx: number, ny: number) {
   return { x: Math.round(nx * vpW), y: Math.round(ny * vpH) };
 }
 
+// Monotonically increasing CDP timestamp in seconds (TimeSinceEpoch).
+// Blink's gesture recognizer uses this to pair press+release into a click.
+function cdpTs(): number { return Date.now() / 1000; }
+
 function keyCode(key: string): number {
   const map: Record<string, number> = {
     Enter: 13, Backspace: 8, Tab: 9, Escape: 27,
@@ -108,23 +121,31 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'mousemove') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    // Puppeteer / Playwright industry-standard triad: move → press → release
-    // at identical coordinates. The initial mouseMoved seeds Blink's
-    // last-known mouse position, which contenteditable / Lexical use to
-    // resolve the caret anchor on mousedown. Without it, the caret falls
-    // back to the previous position (the "jumps to end" regression).
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved',   x, y, button: 'none', buttons: 0 });
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
-    // Refresh last-known position while the button is held so the up
-    // event also hit-tests at (x, y) rather than a cached coord.
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y, button: 'left', buttons: 1 });
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
+    // Strict Puppeteer/Playwright sequence: move → press → release.
+    // No extra move between press and release — a mouseMoved with
+    // buttons:1 is interpreted by Blink as the start of a drag and
+    // cancels caret placement (caret collapses back to previous anchor).
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',    x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',  x, y, button: 'left', buttons: 1, clickCount: 1,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
     lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);
@@ -178,7 +199,11 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'scroll') {
     const { x, y } = coords(0.5, 0.5);
-    await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100 });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x, y,
+      deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 }

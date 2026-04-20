@@ -59,7 +59,7 @@
     resize();
     window.addEventListener('resize', resize);
 
-    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────
+    // ── Actions WS (viewer → relay → CDP) ─────────────────────────────────────
     const actWs = new WebSocket(`ws://localhost:${PORT}/actions`);
     actWs.onclose = () => console.warn('[viewer] actions WS closed');
 
@@ -68,15 +68,16 @@
         actWs.send(JSON.stringify(action));
     }
 
-    // ── Mouse: click + mousemove (throttled) ─────────────────────────
+    // ── Mouse: click + mousemove (throttled) ─────────────────────
     canvas.addEventListener('click', (e) => {
       send({
         type: 'click',
         x: e.offsetX / canvas.width,
         y: e.offsetY / canvas.height,
       });
-      // Park focus on the proxy so Comet's type/beforeinput lands on an editable
-      proxy.focus();
+      // Do NOT call proxy.focus() here — it triggers a ghost Meta keydown on macOS
+      // which gets forwarded to CDP and disrupts Lexical caret position.
+      // The focusout fallback below keeps proxy focused at all other times.
     });
 
     let lastMove = 0;
@@ -91,13 +92,13 @@
       });
     });
 
-    // ── Scroll ───────────────────────────────────────────────
+    // ── Scroll ────────────────────────────────────────────
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       send({ type: 'scroll', x: e.deltaX, y: e.deltaY });
     }, { passive: false });
 
-    // ── Proxy: receives Comet's beforeinput / paste ────────────────────
+    // ── Proxy: receives Comet's beforeinput / paste ──────────────────
     // beforeinput fires on contenteditable for both single chars AND bulk strings
     proxy.addEventListener('beforeinput', (e) => {
       e.preventDefault();
@@ -132,12 +133,14 @@
     });
     proxy.focus();
 
-    // ── Keyboard: special keys + shortcuts ──────────────────────────
+    // ── Keyboard: special keys + shortcuts ────────────────────────
     // Single printable chars from human keyboard still come through keydown.
     // Special keys (Enter, Backspace, arrows) and shortcuts are handled here.
     document.addEventListener('keydown', (e) => {
       // Don't intercept browser shortcuts
       if (e.metaKey && ['r','l','t','w','n'].includes(e.key.toLowerCase())) return;
+      // Drop bare modifier keys — they carry no actionable input
+      if (['Meta', 'Shift', 'Control', 'Alt'].includes(e.key)) return;
 
       e.preventDefault();
 

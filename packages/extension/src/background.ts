@@ -1,15 +1,9 @@
 // src/background.ts — service worker
-// Extension no longer owns CDP. The relay owns the CDP session for each tab.
-// Extension responsibility: capture frames via chrome.tabs.captureVisibleTab and
-// push them to the relay via /stream/push. Actions flow relay → offscreen → (ignored,
-// relay dispatches input via CDP directly).
+// Extension no longer owns CDP or frame capture.
+// The relay owns the CDP session and streams frames via Page.startScreencast.
+// Extension responsibility: manage offscreen document for WebSocket relay bridge.
 
-const FPS     = 5;
-const QUALITY = 60;
-
-let capturing       = false;
-let intervalId      = 0;
-let capturing_frame = false;
+let capturing    = false;
 let captureTabId: number | null = null;
 
 // ── Main click handler ────────────────────────────────────────────────────────
@@ -40,21 +34,6 @@ chrome.action.onClicked.addListener(async (tab) => {
   try {
     await chrome.runtime.sendMessage({ type: 'init', tabId });
   } catch { /* offscreen may not be ready yet — it will request tabId on boot */ }
-
-  // Frame capture via captureVisibleTab — no CDP, no debugger ownership conflict
-  intervalId = setInterval(async () => {
-    if (!capturing || capturing_frame || captureTabId === null) return;
-    capturing_frame = true;
-    try {
-      const dataUrl = await chrome.tabs.captureVisibleTab({ quality: QUALITY });
-      const buf = dataUrlToBuffer(dataUrl);
-      chrome.runtime.sendMessage({ type: 'frame', data: buf }).catch(() => {});
-    } catch (err) {
-      console.warn('[bg] captureVisibleTab error:', (err as Error).message);
-    } finally {
-      capturing_frame = false;
-    }
-  }, Math.round(1000 / FPS)) as unknown as number;
 });
 
 // Respond to offscreen requesting tabId after it boots
@@ -66,18 +45,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 function stopCapture() {
-  capturing       = false;
-  capturing_frame = false;
-  captureTabId    = null;
-  clearInterval(intervalId);
+  capturing    = false;
+  captureTabId = null;
   (chrome.offscreen as any).closeDocument?.().catch(() => {});
   console.log('[bg] capture stopped');
-}
-
-function dataUrlToBuffer(dataUrl: string): ArrayBuffer {
-  const base64 = dataUrl.split(',')[1];
-  const binary = atob(base64);
-  const buf    = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
-  return buf.buffer;
 }

@@ -1,11 +1,37 @@
 /**
- * cdp.ts — direct Chrome DevTools Protocol client.
- * All state is encapsulated in CDPSession so multiple instances can run in parallel.
+ * cdp.ts — Chrome DevTools Protocol client, encapsulated as CDPSession.
+ * Instantiate one CDPSession per relay port / Chrome tab (target) pair.
+ * All sessions may share a single Chrome debug port.
  */
 import { WebSocket } from 'ws';
 
+export type CDPTarget = {
+  id: string;
+  type: string;
+  url: string;
+  webSocketDebuggerUrl: string;
+};
+
+/** Fetch all page targets from a running Chrome instance. */
+export async function listTargets(cdpPort = 9222): Promise<CDPTarget[]> {
+  const res = await fetch(`http://localhost:${cdpPort}/json`);
+  if (!res.ok) throw new Error(`[cdp] Chrome not reachable at localhost:${cdpPort}`);
+  const all = await res.json() as Array<Record<string, string>>;
+  return all
+    .filter(t => t.type === 'page')
+    .map(t => ({
+      id: t.id ?? '',
+      type: t.type ?? '',
+      url: t.url ?? '',
+      webSocketDebuggerUrl: t.webSocketDebuggerUrl ?? '',
+    }));
+}
+
 export class CDPSession {
   readonly cdpPort: number;
+  /** Populated after connect() resolves. */
+  readonly targetId: string = '';
+  readonly targetUrl: string = '';
 
   private cdpWs: WebSocket | null = null;
   private msgId = 1;
@@ -16,6 +42,8 @@ export class CDPSession {
   private reconnectHandler: (() => void) | null = null;
   private didSignalDisconnect = false;
   private screenshotInterval: ReturnType<typeof setInterval> | null = null;
+  /** When set, reconnect will re-attach to this specific target ID. */
+  private pinnedTargetId: string | undefined;
 
   constructor(cdpPort = 9222) {
     this.cdpPort = cdpPort;
@@ -34,23 +62,37 @@ export class CDPSession {
 
   private attachLifecycle(ws: WebSocket): void {
     ws.on('close', () => {
-      console.log(`[cdp:${this.cdpPort}] socket closed`);
+      console.log(`[cdp:${this.cdpPort}/${this.targetId || '?'}] socket closed`);
       this.signalDisconnect();
     });
     ws.on('error', (err) => {
-      console.error(`[cdp:${this.cdpPort}] socket error:`, (err as Error).message);
+      console.error(`[cdp:${this.cdpPort}/${this.targetId || '?'}] socket error:`, (err as Error).message);
       this.signalDisconnect();
     });
   }
 
-  async connect(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
+  /**
+   * Connect to a Chrome tab.
+   * @param screenshotCallback  Called for each captured JPEG frame.
+   * @param targetId            Optional CDP target ID. If omitted, picks the
+   *                            first perplexity.ai page (or first page).
+   */
+  async connect(screenshotCallback: (jpeg: Buffer) => void, targetId?: string): Promise<void> {
     this.screenshotCallback = screenshotCallback;
-    const res = await fetch(`http://localhost:${this.cdpPort}/json`);
-    if (!res.ok) throw new Error(`[cdp:${this.cdpPort}] Chrome not reachable at localhost:${this.cdpPort}`);
-    const targets = await res.json() as Array<{ type: string; webSocketDebuggerUrl: string; url: string }>;
-    const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'))
-               ?? targets.find(t => t.type === 'page');
-    if (!page) throw new Error(`[cdp:${this.cdpPort}] No page target found.`);
+    if (targetId) this.pinnedTargetId = targetId;
+
+    const targets = await listTargets(this.cdpPort);
+
+    let page: CDPTarget | undefined;
+    if (this.pinnedTargetId) {
+      page = targets.find(t => t.id === this.pinnedTargetId);
+      if (!page) throw new Error(`[cdp:${this.cdpPort}] target ${this.pinnedTargetId} not found`);
+    } else {
+      page = targets.find(t => t.url.includes('perplexity.ai')) ?? targets[0];
+      if (!page) throw new Error(`[cdp:${this.cdpPort}] No page target found.`);
+      this.pinnedTargetId = page.id;
+    }
+
     const ws = new WebSocket(page.webSocketDebuggerUrl);
     await new Promise<void>((resolve, reject) => {
       ws.once('open', resolve);
@@ -58,10 +100,13 @@ export class CDPSession {
     });
     this.cdpWs = ws;
     this.didSignalDisconnect = false;
+    // Store target metadata (readonly workaround via cast)
+    (this as { targetId: string }).targetId = page.id;
+    (this as { targetUrl: string }).targetUrl = page.url;
     this.attachLifecycle(ws);
     await this.send('Page.enable', {});
     await this.refreshViewport();
-    console.log(`[cdp:${this.cdpPort}] connected → ${page.url} (viewport ${this.vpW}x${this.vpH})`);
+    console.log(`[cdp:${this.cdpPort}/${page.id}] connected → ${page.url} (viewport ${this.vpW}x${this.vpH})`);
   }
 
   isConnected(): boolean {
@@ -129,7 +174,7 @@ export class CDPSession {
       await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
       this.lastClickAt = Date.now();
       setTimeout(() => this.refreshViewport(), 600);
-      console.log(`[cdp:${this.cdpPort}] click at`, x, y);
+      console.log(`[cdp:${this.cdpPort}/${this.targetId}] click at`, x, y);
       return;
     }
 
@@ -137,7 +182,7 @@ export class CDPSession {
       const sinceClick = Date.now() - this.lastClickAt;
       if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
       const text = action.value as string;
-      console.log(`[cdp:${this.cdpPort}] type:`, JSON.stringify(text.slice(0, 80)));
+      console.log(`[cdp:${this.cdpPort}/${this.targetId}] type:`, JSON.stringify(text.slice(0, 80)));
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -149,7 +194,7 @@ export class CDPSession {
         returnByValue: true,
         awaitPromise: false,
       }) as { result: { value: unknown } };
-      console.log(`[cdp:${this.cdpPort}] execCommand result:`, result?.result?.value);
+      console.log(`[cdp:${this.cdpPort}/${this.targetId}] execCommand result:`, result?.result?.value);
       return;
     }
 
@@ -173,7 +218,7 @@ export class CDPSession {
         }
         await this.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
         await this.send('Input.dispatchKeyEvent', { type: 'keyUp',      key, code, modifiers, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk });
-        console.log(`[cdp:${this.cdpPort}] key:`, key, modifiers ? `(modifiers:${modifiers})` : '');
+        console.log(`[cdp:${this.cdpPort}/${this.targetId}] key:`, key, modifiers ? `(modifiers:${modifiers})` : '');
       }
       return;
     }

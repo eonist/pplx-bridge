@@ -30,7 +30,18 @@ export class RelaySession {
   private reconnectDelayMs = RECONNECT_BASE_MS;
   private reconnectInFlight = false;
 
-  constructor(private port: number, private cdpPort: number) {
+  /**
+   * @param port       Relay HTTP/WS port.
+   * @param cdpPort    Chrome remote debugging port.
+   * @param targetId   Optional CDP target ID. When provided, this session is
+   *                   pinned to a specific Chrome tab. Omit for single-session
+   *                   use (picks the first perplexity.ai tab).
+   */
+  constructor(
+    private port: number,
+    private cdpPort: number,
+    private targetId?: string,
+  ) {
     this.cdp = new CDPSession(cdpPort);
     // stopScreenshots is handled inside reconnectCDP; no need to call it in the handler too
     this.cdp.setReconnectHandler(() => this.scheduleReconnect());
@@ -117,7 +128,7 @@ export class RelaySession {
     this.cdp.stopScreenshots();
     try {
       console.log(`[relay:${this.port}] reconnecting CDP...`);
-      await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg));
+      await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg), this.targetId);
       this.cdp.startScreenshots(SCREENSHOT_FPS);
       console.log(`[relay:${this.port}] CDP reconnected`);
       await this.flushQueuedActions();
@@ -177,10 +188,12 @@ export class RelaySession {
     });
 
     app.get('/health', (_req, res) => res.json({
-      ok: true,
-      port: this.port,
-      cdpPort: this.cdpPort,
-      cdp: this.cdp.isConnected(),
+      ok:        true,
+      port:      this.port,
+      cdpPort:   this.cdpPort,
+      targetId:  this.cdp.targetId  || null,
+      targetUrl: this.cdp.targetUrl || null,
+      cdp:       this.cdp.isConnected(),
     }));
 
     wss.on('connection', (ws, req) => {
@@ -262,10 +275,14 @@ export class RelaySession {
       console.log(`  Actions      ws://localhost:${this.port}/actions`);
       console.log(`  Viewer       http://localhost:${this.port}/live`);
       console.log(`  Health       http://localhost:${this.port}/health\n`);
-      console.log(`  ⚠️  Chrome must be started with --remote-debugging-port=${this.cdpPort}\n`);
+      if (this.targetId) {
+        console.log(`  ⚠️  Pinned to CDP target ${this.targetId} on port ${this.cdpPort}\n`);
+      } else {
+        console.log(`  ⚠️  Chrome must be started with --remote-debugging-port=${this.cdpPort}\n`);
+      }
 
       try {
-        await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg));
+        await this.cdp.connect((jpeg) => this.broadcastFrame(jpeg), this.targetId);
         this.reconnectDelayMs = RECONNECT_BASE_MS;
         this.cdp.startScreenshots(SCREENSHOT_FPS);
         console.log(`[relay:${this.port}] CDP ready — input + screenshots active\n`);

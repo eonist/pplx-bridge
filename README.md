@@ -116,7 +116,7 @@ Open a **new terminal tab** and launch an isolated Chrome profile:
   --user-data-dir=~/.pplx-bridge-profile \
   https://perplexity.ai
 ```
-*(Note: You will need to log into Perplexity on the first run. The custom `--user-data-dir` ensures your session persists across reboots.)*
+*(Note: You will need to log into Perplexity on the first run. The custom `--user-data-dir` ensures your session persists across reboots. For multi-session, open additional `perplexity.ai` tabs in the same Chrome window.)*
 
 ### Stage 5: Start the Relay & Connect
 In your **original terminal tab** (inside the `pplx-bridge` folder):
@@ -136,9 +136,9 @@ Finally, open **Comet** and navigate to `http://localhost:7001/live`. You will s
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `7001` | Relay HTTP/WS port (single session). Alias for `PORTS` with one entry. |
-| `CDP_PORT` | `9222` | Chrome remote debugging port (single session). Alias for `CDP_PORTS` with one entry. |
-| `PORTS` | `7001` | Comma-separated relay ports for multi-session, e.g. `7001,7002` |
-| `CDP_PORTS` | `9222` | Comma-separated Chrome debug ports for multi-session, e.g. `9222,9223`. Must have the same number of entries as `PORTS`. |
+| `CDP_PORT` | `9222` | Chrome remote debugging port. Used for single-session and multi-tab mode. |
+| `PORTS` | `7001` | Comma-separated relay ports, e.g. `7001,7002` |
+| `CDP_PORTS` | — | *(Legacy)* Comma-separated Chrome debug ports for separate-Chrome-per-session mode, e.g. `9222,9223`. Must match `PORTS` length. Omit when using multi-tab mode. |
 
 ### NPM Scripts
 
@@ -150,7 +150,34 @@ Finally, open **Comet** and navigate to `http://localhost:7001/live`. You will s
 ### Running multiple sessions
 
 <details>
-<summary><b>Multi-session setup (two Chrome instances, one relay process)</b></summary>
+<summary><b>Multi-tab mode — one Chrome, multiple tabs (recommended)</b></summary>
+<br/>
+
+Open two or more `perplexity.ai` tabs in your already-running debug Chrome instance, then start the relay with `PORTS` and a single `CDP_PORT`:
+
+```bash
+PORTS=7001,7002 CDP_PORT=9222 pnpm start
+```
+
+The relay auto-discovers open `perplexity.ai` tabs and pins each session to a specific tab by CDP target ID. Each session reconnects to its own tab even after a relay restart.
+
+You will see:
+```
+[main] Multi-tab mode — 2 sessions on CDP port 9222
+[main]   :7001 → target ABC123 (https://www.perplexity.ai/...)
+[main]   :7002 → target DEF456 (https://www.perplexity.ai/...)
+```
+
+Open each viewer in Comet:
+- `http://localhost:7001/live`
+- `http://localhost:7002/live`
+
+Health check per session: `GET http://localhost:700x/health` → `{ ok, port, cdpPort, targetId, targetUrl, cdp }`
+
+</details>
+
+<details>
+<summary><b>Legacy mode — separate Chrome instance per session</b></summary>
 <br/>
 
 Launch one Chrome instance per session, each with its own debugging port and user-data-dir:
@@ -175,11 +202,7 @@ Then start the relay with both port pairs:
 PORTS=7001,7002 CDP_PORTS=9222,9223 pnpm start
 ```
 
-Each session runs fully independently — its own WebSocket endpoints, action queue, screenshot stream, and reconnect loop. Open each viewer in Comet:
-- `http://localhost:7001/live`
-- `http://localhost:7002/live`
-
-Health check per session: `GET http://localhost:700x/health` → `{ ok, port, cdpPort, cdp }`
+Each session runs fully independently — its own WebSocket endpoints, action queue, screenshot stream, and reconnect loop.
 
 </details>
 
@@ -210,7 +233,7 @@ pplx-bridge/
 │   │   └── src/
 │   │       ├── main.ts          # Entry point — spawns one RelaySession per port pair
 │   │       ├── relay-session.ts # Per-session Express + WSS + reconnect logic
-│   │       └── cdp.ts           # CDPSession class — one per Chrome debug port
+│   │       └── cdp.ts           # CDPSession class — multiple sessions may share one Chrome debug port
 │   └── viewer/          # Static live.html canvas viewer
 ├── ACTION_PROTOCOL.md   # Documentation for action payload format
 ├── package.json         # Workspace configuration
@@ -252,9 +275,15 @@ The port is already in use by another process. Run <code>lsof -ti :7001 | xargs 
 </details>
 
 <details>
+<summary><b>Error: <code>Not enough perplexity.ai tabs open</code></b></summary>
+<br/>
+In multi-tab mode, the relay needs one open <code>perplexity.ai</code> tab per requested session. Open the required number of tabs in your debug Chrome instance and run <code>pnpm start</code> again.
+</details>
+
+<details>
 <summary><b>Error: <code>PORTS and CDP_PORTS must have the same number of entries</code></b></summary>
 <br/>
-The number of relay ports and CDP ports must match exactly. Example: <code>PORTS=7001,7002 CDP_PORTS=9222,9223</code>.
+<em>(Legacy multi-Chrome mode only.)</em> The number of relay ports and CDP ports must match exactly. Example: <code>PORTS=7001,7002 CDP_PORTS=9222,9223</code>. For single-Chrome multi-tab mode, use <code>CDP_PORT</code> (singular) instead.
 </details>
 
 <br/>

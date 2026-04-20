@@ -1,5 +1,13 @@
+
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
+ *
+ * Architecture: single persistent CDP message pump.
+ *   - Messages WITH  id  → pending map → resolves matching send() promise (input replies)
+ *   - Messages WITHOUT id  → event dispatcher → Page.screencastFrame handler (video push)
+ *
+ * Video (Page.startScreencast) and input (dispatchMouseEvent etc.) are on separate
+ * paths inside the pump — structurally decoupled, not by timing.
  */
 import { WebSocket } from 'ws';
 
@@ -8,9 +16,11 @@ let msgId = 1;
 let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
-let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
+
+// pending id → {resolve, reject} for all outstanding send() calls
+const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
 
 export function setCDPReconnectHandler(handler: () => void): void {
   _reconnectHandler = handler;
@@ -20,10 +30,41 @@ function signalDisconnect(): void {
   if (_didSignalDisconnect) return;
   _didSignalDisconnect = true;
   cdpWs = null;
+  for (const { reject } of pending.values()) reject(new Error('[cdp] disconnected'));
+  pending.clear();
   _reconnectHandler?.();
 }
 
-function attachLifecycle(ws: WebSocket): void {
+// Unsolicited CDP event dispatcher (messages with no id).
+function handleCDPEvent(method: string, params: Record<string, unknown>): void {
+  if (method === 'Page.screencastFrame') {
+    const data      = params.data as string;
+    const sessionId = (params.metadata as Record<string, unknown>)?.sessionId as number
+                   ?? params.sessionId as number;
+    // ACK immediately — Chrome stops pushing if frames are not ACKed
+    send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+    if (_screenshotCallback && data) {
+      _screenshotCallback(Buffer.from(data, 'base64'));
+    }
+  }
+}
+
+function attachPump(ws: WebSocket): void {
+  ws.on('message', (raw: Buffer) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.id != null) {
+      // Input reply path
+      const cb = pending.get(msg.id as number);
+      if (!cb) return;
+      pending.delete(msg.id as number);
+      if (msg.error) cb.reject(msg.error); else cb.resolve(msg.result);
+    } else if (typeof msg.method === 'string') {
+      // Event push path (screencast frames etc.)
+      handleCDPEvent(msg.method, (msg.params as Record<string, unknown>) ?? {});
+    }
+  });
   ws.on('close', () => {
     console.log('[cdp] socket closed');
     signalDisconnect();
@@ -49,7 +90,7 @@ export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Pr
   });
   cdpWs = ws;
   _didSignalDisconnect = false;
-  attachLifecycle(ws);
+  attachPump(ws);
   await send('Page.enable', {});
   await refreshViewport();
   console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
@@ -62,19 +103,11 @@ export function isCDPConnected(): boolean {
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) return reject(new Error('[cdp] not connected'));
-    const ws = cdpWs;
     const id = msgId++;
-    const onMsg = (data: Buffer) => {
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.id !== id) return;
-      ws.off('message', onMsg);
-      if (msg.error) reject(msg.error); else resolve(msg.result);
-    };
-    ws.on('message', onMsg);
-    ws.send(JSON.stringify({ id, method, params }), (err) => {
+    pending.set(id, { resolve, reject });
+    cdpWs.send(JSON.stringify({ id, method, params }), (err) => {
       if (!err) return;
-      ws.off('message', onMsg);
+      pending.delete(id);
       reject(err);
     });
   });
@@ -93,6 +126,8 @@ function coords(nx: number, ny: number) {
   return { x: Math.round(nx * vpW), y: Math.round(ny * vpH) };
 }
 
+function cdpTs(): number { return Date.now() / 1000; }
+
 function keyCode(key: string): number {
   const map: Record<string, number> = {
     Enter: 13, Backspace: 8, Tab: 9, Escape: 27,
@@ -107,34 +142,47 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'mousemove') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
-    await new Promise(r => setTimeout(r, 80));
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
-    lastClickAt = Date.now();
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',   x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',    x, y, button: 'left', buttons: 1,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);
     return;
   }
 
   if (type === 'type') {
-    const sinceClick = Date.now() - lastClickAt;
-    if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
+    // Do NOT call el.focus() — Lexical's onFocus restores its last
+    // editorState selection (end-of-text), discarding the caret set by
+    // the preceding click. The click already focused the element.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
   if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
-  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
+  return document.execCommand('insertText', false, ${JSON.stringify(text)});
 })()`,
       returnByValue: true,
       awaitPromise: false,
@@ -170,27 +218,31 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'scroll') {
     const { x, y } = coords(0.5, 0.5);
-    await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100 });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x, y,
+      deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 }
 
-let screenshotInterval = 0;
-
-export function startScreenshots(fps = 1): void {
-  if (screenshotInterval) return;
-  let busy = false;
-  screenshotInterval = setInterval(async () => {
-    if (busy || !isCDPConnected()) return;
-    busy = true;
-    try {
-      const result = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };
-      if (_screenshotCallback) _screenshotCallback(Buffer.from(result.data, 'base64'));
-    } catch { /* ignore */ } finally { busy = false; }
-  }, Math.round(1000 / fps)) as unknown as number;
+export function startScreenshots(fps = 5): void {
+  // GPU push screencast — Chrome encodes and pushes frames as unsolicited
+  // Page.screencastFrame events. Handled in handleCDPEvent() above.
+  // everyNthFrame=1 at 60fps internal rate gives ~60fps push; we throttle
+  // to requested fps via everyNthFrame.
+  send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: 60,
+    maxWidth: 1280,
+    maxHeight: 800,
+    everyNthFrame: Math.max(1, Math.round(60 / fps)),
+  }).catch((err) => {
+    console.error('[cdp] startScreencast failed:', (err as Error).message);
+  });
 }
 
 export function stopScreenshots(): void {
-  clearInterval(screenshotInterval);
-  screenshotInterval = 0;
+  send('Page.stopScreencast', {}).catch(() => {});
 }

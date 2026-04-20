@@ -4,16 +4,20 @@ import { createServer, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { connectCDP, handleAction, startScreenshots, isCDPConnected } from './cdp.js';
+import { connectCDP, handleAction, startScreenshots, stopScreenshots, isCDPConnected, setCDPReconnectHandler } from './cdp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT ?? 7001);
+const SCREENSHOT_FPS = 5;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
+const QUEUED_ACTION_MAX = 20;
+const QUEUED_ACTION_TTL_MS = 10_000;
 
 const app    = express();
 const server = createServer(app);
 
-// ── CORS + static viewer ────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 
 app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
@@ -25,7 +29,6 @@ app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => res.sendFile(path.join(publicDir, 'live.html')));
 
-// ── Asset proxy ────────────────────────────────────────────────────
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -44,12 +47,9 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPConnected() }));
 
-// ── WebSocket channels ────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
-
 const streamViewers = new Set<WebSocket>();
 
 function broadcastFrame(jpeg: Buffer): void {
@@ -59,35 +59,123 @@ function broadcastFrame(jpeg: Buffer): void {
   }
 }
 
-// ── Single-char type coalescing (#45) ────────────────────────────────
 let typeBuffer = '';
 let typeTimer: ReturnType<typeof setTimeout> | null = null;
 
-function flushTypeBuffer(): void {
-  if (!typeBuffer) return;
+function flushTypeBuffer(): string {
+  if (!typeBuffer) return '';
   const text = typeBuffer;
   typeBuffer = '';
+  if (typeTimer) {
+    clearTimeout(typeTimer);
+    typeTimer = null;
+  }
   console.log('[relay] flush type:', JSON.stringify(text.slice(0, 80)));
-  handleAction({ type: 'type', value: text }).catch((err) =>
-    console.error('[relay] flush error:', (err as Error).message)
-  );
+  return text;
 }
 
-// ── Cmd+V paste intercept ─────────────────────────────────────────
-// CDP Input.dispatchKeyEvent for Cmd+V cannot access the macOS pasteboard.
-// Instead: read clipboard with pbpaste and inject via Input.insertText.
 function handlePaste(): void {
   try {
     const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
     if (!text) { console.log('[relay] paste: clipboard empty'); return; }
     console.log('[relay] paste:', JSON.stringify(text.slice(0, 80)));
-    handleAction({ type: 'type', value: text }).catch((err) =>
-      console.error('[relay] paste error:', (err as Error).message)
-    );
+    enqueueOrRunAction({ type: 'type', value: text });
   } catch (err) {
     console.error('[relay] pbpaste failed:', (err as Error).message);
   }
 }
+
+type QueuedAction = {
+  action: Record<string, unknown>;
+  expiresAt: number;
+};
+
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelayMs = RECONNECT_BASE_MS;
+let reconnectInFlight = false;
+const queuedActions: QueuedAction[] = [];
+
+function pruneQueuedActions(): void {
+  const now = Date.now();
+  while (queuedActions.length && queuedActions[0]!.expiresAt <= now) queuedActions.shift();
+}
+
+function queueAction(action: Record<string, unknown>): void {
+  pruneQueuedActions();
+  if (queuedActions.length >= QUEUED_ACTION_MAX) queuedActions.shift();
+  queuedActions.push({ action, expiresAt: Date.now() + QUEUED_ACTION_TTL_MS });
+  console.log('[relay] queued action while disconnected:', JSON.stringify(action).slice(0, 120));
+}
+
+async function runAction(action: Record<string, unknown>): Promise<void> {
+  try {
+    await handleAction(action);
+  } catch (err) {
+    if ((err as Error).message?.includes('not connected')) {
+      queueAction(action);
+      scheduleReconnect();
+      return;
+    }
+    console.error('[relay] CDP action error:', (err as Error).message ?? err);
+  }
+}
+
+function enqueueOrRunAction(action: Record<string, unknown>): void {
+  if (!isCDPConnected()) {
+    queueAction(action);
+    scheduleReconnect();
+    return;
+  }
+  runAction(action).catch((err) => {
+    console.error('[relay] action pipeline error:', (err as Error).message ?? err);
+  });
+}
+
+async function flushQueuedActions(): Promise<void> {
+  pruneQueuedActions();
+  while (queuedActions.length && isCDPConnected()) {
+    const next = queuedActions.shift();
+    if (!next || next.expiresAt <= Date.now()) continue;
+    await runAction(next.action);
+  }
+}
+
+async function reconnectCDP(): Promise<void> {
+  if (reconnectInFlight || isCDPConnected()) return;
+  reconnectInFlight = true;
+  stopScreenshots();
+  try {
+    console.log('[relay] reconnecting CDP...');
+    await connectCDP(broadcastFrame);
+    reconnectDelayMs = RECONNECT_BASE_MS;
+    startScreenshots(SCREENSHOT_FPS);
+    console.log('[relay] CDP reconnected');
+    await flushQueuedActions();
+  } catch (err) {
+    console.error('[relay] reconnect failed:', (err as Error).message);
+    scheduleReconnect();
+  } finally {
+    reconnectInFlight = false;
+  }
+}
+
+function scheduleReconnect(): void {
+  if (isCDPConnected() || reconnectTimer || reconnectInFlight) return;
+  const delay = reconnectDelayMs;
+  console.log(`[relay] scheduling reconnect in ${delay}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectCDP().catch((err) => {
+      console.error('[relay] reconnect pipeline error:', (err as Error).message ?? err);
+    });
+  }, delay);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+}
+
+setCDPReconnectHandler(() => {
+  stopScreenshots();
+  scheduleReconnect();
+});
 
 wss.on('connection', (ws, req) => {
   const url = req.url ?? '';
@@ -121,36 +209,35 @@ wss.on('connection', (ws, req) => {
       if (!isReceiver) {
         if (!parsed) return;
 
-        // Intercept Cmd+V: read macOS clipboard and inject as insertText
         if (
           parsed.type === 'keydown' &&
           parsed.key === 'v' &&
           parsed.metaKey === true
         ) {
-          flushTypeBuffer();
+          const buffered = flushTypeBuffer();
+          if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
           console.log('[relay] action → Cmd+V (intercepted as paste)');
           handlePaste();
           return;
         }
 
-        // Buffer rapid single-char type actions
         if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
           typeBuffer += parsed.value as string;
           if (typeTimer) clearTimeout(typeTimer);
-          typeTimer = setTimeout(flushTypeBuffer, 200);
+          typeTimer = setTimeout(() => {
+            const buffered = flushTypeBuffer();
+            if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
+          }, 200);
           return;
         }
 
-        // Flush buffer before any other action
-        flushTypeBuffer();
-        if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
+        const buffered = flushTypeBuffer();
+        if (buffered) enqueueOrRunAction({ type: 'type', value: buffered });
 
         if (parsed.type !== 'mousemove') {
           console.log('[relay] action →', JSON.stringify(parsed).slice(0, 120));
         }
-        handleAction(parsed).catch((err) => {
-          console.error('[relay] CDP action error:', (err as Error).message ?? err);
-        });
+        enqueueOrRunAction(parsed);
       }
     });
 
@@ -177,10 +264,12 @@ server.listen(PORT, async () => {
 
   try {
     await connectCDP(broadcastFrame);
-    startScreenshots(5);
+    reconnectDelayMs = RECONNECT_BASE_MS;
+    startScreenshots(SCREENSHOT_FPS);
     console.log('[relay] CDP ready — input + screenshots active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);
     console.error('[relay] Start Chrome with --remote-debugging-port=9222 and restart relay\n');
+    scheduleReconnect();
   }
 });

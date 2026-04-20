@@ -102,6 +102,26 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+// After CDP Input.dispatchMouseEvent places the native caret, Lexical's internal
+// EditorState selection is still stale (Lexical listens to pointerdown, not
+// mousedown, to update its PointSelection). On the next React reconciliation
+// (triggered by screenshot paints) Lexical restores its stale selection —
+// snapping the caret to the end. Dispatching a synthetic pointerdown+pointerup
+// via Runtime.evaluate at the same coordinates forces Lexical to update its
+// internal selection to match where the native caret actually landed.
+async function dispatchSyntheticPointer(x: number, y: number): Promise<void> {
+  const expr = `(function() {
+    var el = document.elementFromPoint(${x}, ${y});
+    if (!el) return;
+    var opts = { bubbles: true, cancelable: true, clientX: ${x}, clientY: ${y}, view: window };
+    el.dispatchEvent(new PointerEvent('pointerdown', opts));
+    el.dispatchEvent(new PointerEvent('pointerup',   opts));
+  })()`;
+  try {
+    await send('Runtime.evaluate', { expression: expr, returnByValue: false, awaitPromise: false });
+  } catch { /* non-fatal */ }
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -117,6 +137,9 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     await new Promise(r => setTimeout(r, 80));
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
+    // Dispatch synthetic pointer events so Lexical updates its internal
+    // EditorState selection to match the native caret position set above.
+    await dispatchSyntheticPointer(x, y);
     lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);

@@ -1,19 +1,20 @@
 // src/background.ts — service worker
-// Extension no longer owns CDP or frame capture.
-// The relay owns the CDP session and streams frames via Page.startScreencast.
-// Extension responsibility: manage offscreen document for WebSocket relay bridge.
+// Extension no longer owns CDP. The relay owns the CDP session for each tab.
+// Extension responsibility: create the offscreen document so it can maintain
+// persistent WebSocket connections to the relay. Frame capture is handled
+// entirely by the relay via Page.startScreencast — captureVisibleTab must NOT
+// be used here because it activates the captured tab, firing focus/visibility
+// events that reset Lexical's caret position in background tabs.
 
-let capturing    = false;
+let offscreenReady = false;
 let captureTabId: number | null = null;
 
 // ── Main click handler ────────────────────────────────────────────────────────
 chrome.action.onClicked.addListener(async (tab) => {
-  if (capturing) { stopCapture(); return; }
   if (!tab.id) return;
   const tabId = tab.id;
   captureTabId = tabId;
-  capturing = true;
-  console.log('[bg] starting capture for tab', tabId);
+  console.log('[bg] activating relay bridge for tab', tabId);
 
   // Create offscreen document — owns WebSocket connections persistently
   try {
@@ -25,6 +26,7 @@ chrome.action.onClicked.addListener(async (tab) => {
         justification: 'Persistent WebSocket relay bridge for pplx-bridge',
       });
       console.log('[bg] offscreen document created');
+      offscreenReady = true;
     }
   } catch (err) {
     console.error('[bg] offscreen create failed:', err);
@@ -43,10 +45,3 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 });
-
-function stopCapture() {
-  capturing    = false;
-  captureTabId = null;
-  (chrome.offscreen as any).closeDocument?.().catch(() => {});
-  console.log('[bg] capture stopped');
-}

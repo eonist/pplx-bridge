@@ -4,16 +4,17 @@ import { createServer, ServerResponse } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { connectCDP, handleAction, startScreenshots, isCDPConnected } from './cdp.js';
+import { connectCDP, handleAction, startScreenshots, getCDPState } from './cdp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT ?? 7001);
+const STARTUP_RETRY_MS = 2000;
+const STARTUP_MAX_ATTEMPTS = 30;
 
 const app    = express();
 const server = createServer(app);
 
-// ── CORS + static viewer ────────────────────────────────────────────────
 const publicDir = path.join(__dirname, 'public');
 
 app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
@@ -25,7 +26,6 @@ app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void
 app.use(express.static(publicDir));
 app.get('/live', (_req, res) => res.sendFile(path.join(publicDir, 'live.html')));
 
-// ── Asset proxy ────────────────────────────────────────────────────
 app.get('/assets/*', async (req, res) => {
   const raw    = (req.params as Record<string, string>)[0];
   const target = decodeURIComponent(raw);
@@ -44,10 +44,8 @@ app.get('/assets/*', async (req, res) => {
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: isCDPConnected() }));
+app.get('/health', (_req, res) => res.json({ ok: true, port: PORT, cdp: getCDPState() }));
 
-// ── WebSocket channels ────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
 const streamViewers = new Set<WebSocket>();
@@ -59,7 +57,6 @@ function broadcastFrame(jpeg: Buffer): void {
   }
 }
 
-// ── Single-char type coalescing (#45) ────────────────────────────────
 let typeBuffer = '';
 let typeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -73,9 +70,6 @@ function flushTypeBuffer(): void {
   );
 }
 
-// ── Cmd+V paste intercept ─────────────────────────────────────────
-// CDP Input.dispatchKeyEvent for Cmd+V cannot access the macOS pasteboard.
-// Instead: read clipboard with pbpaste and inject via Input.insertText.
 function handlePaste(): void {
   try {
     const text = execSync('pbpaste', { encoding: 'utf8' }).trim();
@@ -121,7 +115,6 @@ wss.on('connection', (ws, req) => {
       if (!isReceiver) {
         if (!parsed) return;
 
-        // Intercept Cmd+V: read macOS clipboard and inject as insertText
         if (
           parsed.type === 'keydown' &&
           parsed.key === 'v' &&
@@ -133,7 +126,6 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Buffer rapid single-char type actions
         if (parsed.type === 'type' && typeof parsed.value === 'string' && parsed.value.length === 1) {
           typeBuffer += parsed.value as string;
           if (typeTimer) clearTimeout(typeTimer);
@@ -141,7 +133,6 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Flush buffer before any other action
         flushTypeBuffer();
         if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
 
@@ -160,6 +151,25 @@ wss.on('connection', (ws, req) => {
   }
 });
 
+async function connectWithRetry(): Promise<void> {
+  for (let attempt = 1; attempt <= STARTUP_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await connectCDP(broadcastFrame);
+      startScreenshots(5);
+      console.log('[relay] CDP ready — input + screenshots active\n');
+      return;
+    } catch (err) {
+      const message = (err as Error).message;
+      console.error(`[relay] CDP connect failed (attempt ${attempt}/${STARTUP_MAX_ATTEMPTS}):`, message);
+      if (attempt === STARTUP_MAX_ATTEMPTS) {
+        console.error('[relay] CDP unavailable after startup retries; background reconnect remains active\n');
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, STARTUP_RETRY_MS));
+    }
+  }
+}
+
 server.listen(PORT, async () => {
   const w = 44;
   console.log(`\n╔${'═'.repeat(w)}╗`);
@@ -175,12 +185,5 @@ server.listen(PORT, async () => {
   console.log(`       --user-data-dir=/tmp/pplx-bridge-profile \\`);
   console.log(`       https://perplexity.ai\n`);
 
-  try {
-    await connectCDP(broadcastFrame);
-    startScreenshots(5);
-    console.log('[relay] CDP ready — input + screenshots active\n');
-  } catch (err) {
-    console.error('[relay] CDP connect failed:', (err as Error).message);
-    console.error('[relay] Start Chrome with --remote-debugging-port=9222 and restart relay\n');
-  }
+  await connectWithRetry();
 });

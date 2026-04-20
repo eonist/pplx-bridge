@@ -9,27 +9,102 @@ let vpW = 1280;
 let vpH = 800;
 let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempts = 0;
+let reconnectInFlight: Promise<void> | null = null;
+let started = false;
+let isConnecting = false;
 
-export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
-  _screenshotCallback = screenshotCallback;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 10_000;
+
+function attachSocketLifecycleHandlers(): void {
+  if (!cdpWs) return;
+
+  cdpWs.on('close', () => {
+    console.warn('[cdp] socket closed');
+    cdpWs = null;
+    scheduleReconnect();
+  });
+
+  cdpWs.on('error', (err) => {
+    console.warn('[cdp] socket error:', (err as Error).message);
+  });
+}
+
+async function openCDP(): Promise<void> {
   const res = await fetch('http://localhost:9222/json');
   if (!res.ok) throw new Error('[cdp] Chrome not reachable at localhost:9222');
   const targets = await res.json() as Array<{ type: string; webSocketDebuggerUrl: string; url: string }>;
   const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'))
              ?? targets.find(t => t.type === 'page');
   if (!page) throw new Error('[cdp] No page target found.');
-  cdpWs = new WebSocket(page.webSocketDebuggerUrl);
+
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise<void>((resolve, reject) => {
-    cdpWs!.once('open', resolve);
-    cdpWs!.once('error', reject);
+    ws.once('open', resolve);
+    ws.once('error', reject);
   });
+
+  cdpWs = ws;
+  attachSocketLifecycleHandlers();
   await send('Page.enable', {});
   await refreshViewport();
-  console.log(`[cdp] connected \u2192 ${page.url} (viewport ${vpW}x${vpH})`);
+  reconnectAttempts = 0;
+  console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
+}
+
+function scheduleReconnect(): void {
+  if (!started || reconnectTimer || reconnectInFlight) return;
+  const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+  reconnectAttempts += 1;
+  console.log(`[cdp] reconnect scheduled in ${delay}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectCDP().catch((err) => {
+      console.error('[cdp] reconnect failed:', (err as Error).message);
+      scheduleReconnect();
+    });
+  }, delay);
+}
+
+export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Promise<void> {
+  _screenshotCallback = screenshotCallback;
+  started = true;
+  await reconnectCDP();
+}
+
+export async function reconnectCDP(): Promise<void> {
+  if (reconnectInFlight) return reconnectInFlight;
+  reconnectInFlight = (async () => {
+    isConnecting = true;
+    try {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (cdpWs) {
+        try { cdpWs.removeAllListeners(); } catch {}
+        try { cdpWs.close(); } catch {}
+        cdpWs = null;
+      }
+      await openCDP();
+    } finally {
+      isConnecting = false;
+      reconnectInFlight = null;
+    }
+  })();
+  return reconnectInFlight;
 }
 
 export function isCDPConnected(): boolean {
   return cdpWs?.readyState === WebSocket.OPEN;
+}
+
+export function getCDPState(): 'open' | 'reconnecting' | 'offline' {
+  if (cdpWs?.readyState === WebSocket.OPEN) return 'open';
+  if (isConnecting || reconnectInFlight || reconnectTimer) return 'reconnecting';
+  return 'offline';
 }
 
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -97,10 +172,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
 
-    // Focus the Lexical contenteditable and insert text via execCommand.
-    // execCommand('insertText') is the only trusted insertion path from a CDP session —
-    // synthetic InputEvent/beforeinput dispatched via Runtime.evaluate have isTrusted:false
-    // which Lexical ignores. Input.insertText is a no-op without OS-level focus.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
   var el = document.querySelector('[data-lexical-editor="true"]');
@@ -128,12 +199,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
     if (special.includes(key) || modifiers) {
       if (key === 'Enter' && !modifiers) {
-        // Sync Lexical EditorState immediately before Enter.
-        // execCommand('insertText') writes to the DOM but Lexical's internal state
-        // tree may not reconcile until a real keypress arrives. A space+backspace
-        // here is invisible to the user but forces Lexical to process the input
-        // event pipeline so the subsequent Enter submit fires correctly.
-        // This is placed on Enter (not on type) so human typing is never affected.
         await send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });
         await send('Input.dispatchKeyEvent', { type: 'keyUp',   key: ' ', text: ' ', unmodifiedText: ' ' });

@@ -1,7 +1,5 @@
 /**
  * cdp.ts — Chrome DevTools Protocol client, encapsulated as CDPSession.
- * Instantiate one CDPSession per relay port / Chrome tab (target) pair.
- * All sessions may share a single Chrome debug port.
  */
 import { WebSocket } from 'ws';
 
@@ -12,7 +10,6 @@ export type CDPTarget = {
   webSocketDebuggerUrl: string;
 };
 
-/** Fetch all page targets from a running Chrome instance. */
 export async function listTargets(cdpPort = 9222): Promise<CDPTarget[]> {
   const res = await fetch(`http://localhost:${cdpPort}/json`);
   if (!res.ok) throw new Error(`[cdp] Chrome not reachable at localhost:${cdpPort}`);
@@ -32,7 +29,6 @@ export class CDPSession {
 
   private _targetId  = '';
   private _targetUrl = '';
-  /** Populated after connect() resolves. */
   get targetId()  { return this._targetId; }
   get targetUrl() { return this._targetUrl; }
 
@@ -45,10 +41,7 @@ export class CDPSession {
   private reconnectHandler: (() => void) | null = null;
   private didSignalDisconnect = false;
   private screenshotInterval: ReturnType<typeof setInterval> | null = null;
-  /** When set, reconnect will re-attach to this specific target ID. */
   private pinnedTargetId: string | undefined;
-
-  // Generic CDP event listeners: method → Set of handlers
   private eventListeners = new Map<string, Set<(params: Record<string, unknown>) => void>>();
 
   constructor(cdpPort = 9222) {
@@ -70,12 +63,9 @@ export class CDPSession {
     ws.on('message', (data: Buffer) => {
       let msg: Record<string, unknown>;
       try { msg = JSON.parse(data.toString()); } catch { return; }
-      // Route CDP events to registered listeners
       if (typeof msg.method === 'string' && msg.params) {
         const listeners = this.eventListeners.get(msg.method as string);
-        if (listeners) {
-          for (const fn of listeners) fn(msg.params as Record<string, unknown>);
-        }
+        if (listeners) for (const fn of listeners) fn(msg.params as Record<string, unknown>);
       }
     });
     ws.on('close', () => {
@@ -88,21 +78,11 @@ export class CDPSession {
     });
   }
 
-  private cdpOn(method: string, handler: (params: Record<string, unknown>) => void): void {
-    if (!this.eventListeners.has(method)) this.eventListeners.set(method, new Set());
-    this.eventListeners.get(method)!.add(handler);
-  }
-
-  private cdpOff(method: string, handler: (params: Record<string, unknown>) => void): void {
-    this.eventListeners.get(method)?.delete(handler);
-  }
-
   async connect(screenshotCallback: (jpeg: Buffer) => void, targetId?: string): Promise<void> {
     this.screenshotCallback = screenshotCallback;
     if (targetId) this.pinnedTargetId = targetId;
 
     const targets = await listTargets(this.cdpPort);
-
     let page: CDPTarget | undefined;
     if (this.pinnedTargetId) {
       page = targets.find(t => t.id === this.pinnedTargetId);
@@ -194,6 +174,34 @@ export class CDPSession {
       this.lastClickAt = Date.now();
       setTimeout(() => this.refreshViewport(), 600);
       console.log(`[cdp:${this.cdpPort}/${this._targetId}] click at`, x, y);
+
+      // Log what element received focus after the click
+      setTimeout(async () => {
+        try {
+          const info = await this.send('Runtime.evaluate', {
+            expression: `(function() {
+  var ae = document.activeElement;
+  var sel = window.getSelection();
+  var lexical = document.querySelector('[data-lexical-editor="true"]');
+  return JSON.stringify({
+    activeTag: ae ? ae.tagName : 'none',
+    activeClass: ae ? ae.className.slice(0,80) : '',
+    activeIsLexical: ae === lexical,
+    activeIsBody: ae === document.body,
+    selectionType: sel ? sel.type : 'none',
+    selectionAnchorOffset: sel && sel.anchorNode ? sel.anchorOffset : -1,
+    selectionFocusOffset: sel && sel.focusNode ? sel.focusOffset : -1,
+    selectionAnchorNodeType: sel && sel.anchorNode ? sel.anchorNode.nodeType : -1,
+    lexicalExists: !!lexical,
+    lexicalHasFocus: lexical ? lexical.contains(document.activeElement) : false,
+  });
+})()`,
+            returnByValue: true,
+            awaitPromise: false,
+          }) as { result: { value: string } };
+          console.log(`[cdp:${this.cdpPort}/${this._targetId}] [post-click state]`, info?.result?.value);
+        } catch (e) { console.warn(`[cdp:${this.cdpPort}/${this._targetId}] post-click probe failed`, e); }
+      }, 200);
       return;
     }
 
@@ -202,15 +210,39 @@ export class CDPSession {
       if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
       const text = action.value as string;
       console.log(`[cdp:${this.cdpPort}/${this._targetId}] type:`, JSON.stringify(text.slice(0, 80)));
+
       const result = await this.send('Runtime.evaluate', {
         expression: `(function() {
+  var ae = document.activeElement;
+  var sel = window.getSelection();
+  var lexical = document.querySelector('[data-lexical-editor="true"]');
+  var preInfo = {
+    activeTag: ae ? ae.tagName : 'none',
+    activeIsLexical: ae === lexical,
+    activeIsBody: ae === document.body,
+    lexicalHasFocus: lexical ? lexical.contains(document.activeElement) : false,
+    selectionType: sel ? sel.type : 'none',
+    anchorOffset: sel && sel.anchorNode ? sel.anchorOffset : -1,
+    focusOffset: sel && sel.focusNode ? sel.focusOffset : -1,
+    anchorNodeValue: sel && sel.anchorNode ? (sel.anchorNode.nodeValue || '').slice(-30) : '',
+    textLen: lexical ? lexical.textContent.length : -1,
+  };
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
+  var ae2 = document.activeElement;
+  var sel2 = window.getSelection();
+  var postInfo = {
+    activeTag: ae2 ? ae2.tagName : 'none',
+    activeIsLexical: ae2 === lexical,
+    selectionType: sel2 ? sel2.type : 'none',
+    anchorOffset: sel2 && sel2.anchorNode ? sel2.anchorOffset : -1,
+    textLen: lexical ? lexical.textContent.length : -1,
+  };
+  return JSON.stringify({ ok, pre: preInfo, post: postInfo });
 })()`,
         returnByValue: true,
         awaitPromise: false,
-      }) as { result: { value: unknown } };
-      console.log(`[cdp:${this.cdpPort}/${this._targetId}] execCommand result:`, result?.result?.value);
+      }) as { result: { value: string } };
+      console.log(`[cdp:${this.cdpPort}/${this._targetId}] [type result]`, result?.result?.value);
       return;
     }
 
@@ -225,6 +257,29 @@ export class CDPSession {
       const vk        = this.keyCode(key);
       const special   = ['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'];
       if (special.includes(key) || modifiers) {
+        // Log selection state before sending key
+        try {
+          const kinfo = await this.send('Runtime.evaluate', {
+            expression: `(function() {
+  var ae = document.activeElement;
+  var sel = window.getSelection();
+  var lexical = document.querySelector('[data-lexical-editor="true"]');
+  return JSON.stringify({
+    key: ${JSON.stringify(key)},
+    activeTag: ae ? ae.tagName : 'none',
+    activeIsBody: ae === document.body,
+    lexicalHasFocus: lexical ? lexical.contains(document.activeElement) : false,
+    selectionType: sel ? sel.type : 'none',
+    anchorOffset: sel && sel.anchorNode ? sel.anchorOffset : -1,
+    textLen: lexical ? lexical.textContent.length : -1,
+  });
+})()`,
+            returnByValue: true,
+            awaitPromise: false,
+          }) as { result: { value: string } };
+          console.log(`[cdp:${this.cdpPort}/${this._targetId}] [pre-key state]`, kinfo?.result?.value);
+        } catch { /* ignore */ }
+
         if (key === 'Enter' && !modifiers) {
           await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', text: ' ', unmodifiedText: ' ' });
           await this.send('Input.dispatchKeyEvent', { type: 'char',    key: ' ', text: ' ', unmodifiedText: ' ' });

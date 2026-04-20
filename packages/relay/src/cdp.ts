@@ -1,5 +1,10 @@
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
+ *
+ * Screenshot strategy: Page.startScreencast (push) instead of polling
+ * Page.captureScreenshot (request/response). This separates the video
+ * channel (unsolicited CDP events) from the input channel (request/response
+ * send() calls), so they can never contend on the WebSocket message queue.
  */
 import { WebSocket } from 'ws';
 
@@ -11,7 +16,7 @@ let _screenshotCallback: ((jpeg: Buffer) => void) | null = null;
 let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
-let _screenshotPausedUntil = 0;
+let _screencastRunning = false;
 
 export function setCDPReconnectHandler(handler: () => void): void {
   _reconnectHandler = handler;
@@ -20,6 +25,7 @@ export function setCDPReconnectHandler(handler: () => void): void {
 function signalDisconnect(): void {
   if (_didSignalDisconnect) return;
   _didSignalDisconnect = true;
+  _screencastRunning = false;
   cdpWs = null;
   _reconnectHandler?.();
 }
@@ -32,6 +38,28 @@ function attachLifecycle(ws: WebSocket): void {
   ws.on('error', (err) => {
     console.error('[cdp] socket error:', (err as Error).message);
     signalDisconnect();
+  });
+}
+
+/**
+ * Persistent event listener for unsolicited CDP events (method-only messages).
+ * Handles Page.screencastFrame — Chrome pushes these without us asking,
+ * so they never block or are blocked by input send() calls.
+ */
+function attachEventListener(ws: WebSocket): void {
+  ws.on('message', (data: Buffer) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    // Unsolicited events have no id
+    if (msg.id !== undefined) return;
+    if (msg.method === 'Page.screencastFrame') {
+      const params = msg.params as Record<string, unknown>;
+      const sessionId = params.sessionId as number;
+      const jpeg = Buffer.from(params.data as string, 'base64');
+      if (_screenshotCallback) _screenshotCallback(jpeg);
+      // Ack is required — without it Chrome stops sending frames
+      send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+    }
   });
 }
 
@@ -51,6 +79,7 @@ export async function connectCDP(screenshotCallback: (jpeg: Buffer) => void): Pr
   cdpWs = ws;
   _didSignalDisconnect = false;
   attachLifecycle(ws);
+  attachEventListener(ws);
   await send('Page.enable', {});
   await refreshViewport();
   console.log(`[cdp] connected → ${page.url} (viewport ${vpW}x${vpH})`);
@@ -114,9 +143,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    // Pause screenshots for 400ms so screenshot CDP calls don't interleave
-    // with the move→press→move→release triad and disrupt Blink's hit-test timing.
-    _screenshotPausedUntil = Date.now() + 400;
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved',   x, y, button: 'none', buttons: 0 });
     await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved',    x, y, button: 'left', buttons: 1 });
@@ -181,25 +207,33 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
   }
 }
 
-let screenshotInterval = 0;
-
-export function startScreenshots(fps = 1): void {
-  if (screenshotInterval) return;
-  let busy = false;
-  screenshotInterval = setInterval(async () => {
-    if (busy || !isCDPConnected()) return;
-    // Skip screenshot if a click is in flight — avoids CDP message contention
-    // that disrupts Blink's hit-test timing for the click triad.
-    if (Date.now() < _screenshotPausedUntil) return;
-    busy = true;
-    try {
-      const result = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };
-      if (_screenshotCallback) _screenshotCallback(Buffer.from(result.data, 'base64'));
-    } catch { /* ignore */ } finally { busy = false; }
-  }, Math.round(1000 / fps)) as unknown as number;
+/**
+ * Start Chrome's push-based screencast. Chrome emits Page.screencastFrame
+ * events (handled in attachEventListener) — no polling, no request/response
+ * contention with input events.
+ */
+export async function startScreenshots(fps = 5): Promise<void> {
+  if (_screencastRunning || !isCDPConnected()) return;
+  try {
+    await send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 60,
+      maxWidth: vpW,
+      maxHeight: vpH,
+      everyNthFrame: 1,
+    });
+    _screencastRunning = true;
+    console.log(`[cdp] screencast started (push, ~${fps}fps target)`);
+  } catch (err) {
+    console.error('[cdp] startScreencast failed:', (err as Error).message);
+  }
 }
 
-export function stopScreenshots(): void {
-  clearInterval(screenshotInterval);
-  screenshotInterval = 0;
+export async function stopScreenshots(): Promise<void> {
+  if (!_screencastRunning || !isCDPConnected()) { _screencastRunning = false; return; }
+  try {
+    await send('Page.stopScreencast', {});
+  } catch { /* ignore */ } finally {
+    _screencastRunning = false;
+  }
 }

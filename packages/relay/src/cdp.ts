@@ -208,7 +208,6 @@ export class CDPSession {
   var el = document.activeElement;
   if (!el || el === document.body) {
     el = document.querySelector('[data-lexical-editor="true"]');
-    if (el) el.focus();
   }
   var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
   return ok;

@@ -1,3 +1,4 @@
+
 /**
  * cdp.ts — direct Chrome DevTools Protocol client.
  */
@@ -12,6 +13,8 @@ let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
 
+const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+
 export function setCDPReconnectHandler(handler: () => void): void {
   _reconnectHandler = handler;
 }
@@ -20,10 +23,22 @@ function signalDisconnect(): void {
   if (_didSignalDisconnect) return;
   _didSignalDisconnect = true;
   cdpWs = null;
+  for (const { reject } of pending.values()) reject(new Error('[cdp] disconnected'));
+  pending.clear();
   _reconnectHandler?.();
 }
 
 function attachLifecycle(ws: WebSocket): void {
+  ws.on('message', (data: Buffer) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    const id = msg.id as number | undefined;
+    if (id == null) return;
+    const cb = pending.get(id);
+    if (!cb) return;
+    pending.delete(id);
+    if (msg.error) cb.reject(msg.error); else cb.resolve(msg.result);
+  });
   ws.on('close', () => {
     console.log('[cdp] socket closed');
     signalDisconnect();
@@ -62,19 +77,11 @@ export function isCDPConnected(): boolean {
 function send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!cdpWs || cdpWs.readyState !== WebSocket.OPEN) return reject(new Error('[cdp] not connected'));
-    const ws = cdpWs;
     const id = msgId++;
-    const onMsg = (data: Buffer) => {
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.id !== id) return;
-      ws.off('message', onMsg);
-      if (msg.error) reject(msg.error); else resolve(msg.result);
-    };
-    ws.on('message', onMsg);
-    ws.send(JSON.stringify({ id, method, params }), (err) => {
+    pending.set(id, { resolve, reject });
+    cdpWs.send(JSON.stringify({ id, method, params }), (err) => {
       if (!err) return;
-      ws.off('message', onMsg);
+      pending.delete(id);
       reject(err);
     });
   });
@@ -93,6 +100,8 @@ function coords(nx: number, ny: number) {
   return { x: Math.round(nx * vpW), y: Math.round(ny * vpH) };
 }
 
+function cdpTs(): number { return Date.now() / 1000; }
+
 function keyCode(key: string): number {
   const map: Record<string, number> = {
     Enter: 13, Backspace: 8, Tab: 9, Escape: 27,
@@ -102,21 +111,64 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+// After CDP move/press/release, dispatch synthetic pointer+mouse events
+// directly into the page so Lexical's own mousedown handler fires with
+// the correct clientX/clientY. Lexical reconciles its editorState
+// selection from the DOM after mousedown; without this, a concurrent
+// React reconciliation can overwrite the Blink-placed caret with the
+// last editorState selection (end-of-text after focus-restore).
+async function dispatchSyntheticClick(x: number, y: number): Promise<void> {
+  await send('Runtime.evaluate', {
+    expression: `(function() {
+  var el = document.elementFromPoint(${x}, ${y});
+  if (!el) return;
+  var init = {
+    bubbles: true, cancelable: true, view: window,
+    clientX: ${x}, clientY: ${y},
+    screenX: ${x}, screenY: ${y},
+    buttons: 1, button: 0
+  };
+  el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, init, { pointerId: 1, pointerType: 'mouse', isPrimary: true })));
+  el.dispatchEvent(new MouseEvent('mousedown', init));
+  el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, init, { buttons: 0 })));
+  el.dispatchEvent(new MouseEvent('click', Object.assign({}, init, { buttons: 0 })));
+})()`,
+    returnByValue: false,
+    awaitPromise: false,
+  });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
   if (type === 'mousemove') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
-    await new Promise(r => setTimeout(r, 80));
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed',  x, y, button: 'left', clickCount: 1, buttons: 1 });
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1, buttons: 0 });
+    // Step 1: CDP move/press/release — Blink places caret via hit-test.
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved',    x, y, button: 'none', buttons: 0,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',  x, y, button: 'left', buttons: 1, clickCount: 1,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
+      pointerType: 'mouse',  timestamp: cdpTs(),
+    });
+    // Step 2: Synthetic JS events so Lexical's mousedown handler fires
+    // with correct coords and adopts the Blink-placed caret into its
+    // editorState, preventing it from reconciling backwards to end-of-text.
+    await dispatchSyntheticClick(x, y);
     lastClickAt = Date.now();
     setTimeout(() => refreshViewport(), 600);
     console.log('[cdp] click at', x, y);
@@ -128,13 +180,12 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
+    // Do NOT focus by selector — Lexical.focus() restores end-of-text selection.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
-  var el = document.querySelector('[data-lexical-editor="true"]');
-  if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
-  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
+  var el = document.activeElement;
+  if (!el || el === document.body) return false;
+  return document.execCommand('insertText', false, ${JSON.stringify(text)});
 })()`,
       returnByValue: true,
       awaitPromise: false,
@@ -170,7 +221,11 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'scroll') {
     const { x, y } = coords(0.5, 0.5);
-    await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100 });
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel', x, y,
+      deltaX: (action.x as number) * 100, deltaY: (action.y as number) * 100,
+      pointerType: 'mouse', timestamp: cdpTs(),
+    });
     return;
   }
 }

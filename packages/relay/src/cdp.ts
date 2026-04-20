@@ -13,9 +13,6 @@ let lastClickAt = 0;
 let _reconnectHandler: (() => void) | null = null;
 let _didSignalDisconnect = false;
 
-// Single persistent message pump + pending-call map. Prevents the
-// EventEmitter listener leak we hit under scroll/click bursts, and
-// guarantees in-order delivery of replies regardless of call volume.
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
 
 export function setCDPReconnectHandler(handler: () => void): void {
@@ -36,7 +33,7 @@ function attachLifecycle(ws: WebSocket): void {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(data.toString()); } catch { return; }
     const id = msg.id as number | undefined;
-    if (id == null) return; // CDP event, not a reply — ignore
+    if (id == null) return;
     const cb = pending.get(id);
     if (!cb) return;
     pending.delete(id);
@@ -103,8 +100,6 @@ function coords(nx: number, ny: number) {
   return { x: Math.round(nx * vpW), y: Math.round(ny * vpH) };
 }
 
-// Monotonically increasing CDP timestamp in seconds (TimeSinceEpoch).
-// Blink's gesture recognizer uses this to pair press+release into a click.
 function cdpTs(): number { return Date.now() / 1000; }
 
 function keyCode(key: string): number {
@@ -130,10 +125,6 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
 
   if (type === 'click') {
     const { x, y } = coords(action.x as number, action.y as number);
-    // Strict Puppeteer/Playwright sequence: move → press → release.
-    // No extra move between press and release — a mouseMoved with
-    // buttons:1 is interpreted by Blink as the start of a drag and
-    // cancels caret placement (caret collapses back to previous anchor).
     await send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',    x, y, button: 'none', buttons: 0,
       pointerType: 'mouse',  timestamp: cdpTs(),
@@ -157,13 +148,17 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
+    // IMPORTANT: do NOT .focus() the editor by selector. Lexical's
+    // focus() restores its last known selection (end of text), which
+    // overrides the caret we just placed via mouseclick and causes
+    // subsequent clicks to land at end-of-text. Use whatever element
+    // already has focus; if nothing does, skip silently so we never
+    // steal focus away from a freshly-placed caret.
     const result = await send('Runtime.evaluate', {
       expression: `(function() {
-  var el = document.querySelector('[data-lexical-editor="true"]');
-  if (!el) el = document.activeElement;
-  if (el) { el.focus(); }
-  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
+  var el = document.activeElement;
+  if (!el || el === document.body) return false;
+  return document.execCommand('insertText', false, ${JSON.stringify(text)});
 })()`,
       returnByValue: true,
       awaitPromise: false,

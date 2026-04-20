@@ -151,11 +151,11 @@ async function flushQueuedActions(): Promise<void> {
 async function reconnectCDP(): Promise<void> {
   if (reconnectInFlight || isCDPConnected()) return;
   reconnectInFlight = true;
-  stopScreenshots();
+  await stopScreenshots();
   try {
     console.log('[relay] reconnecting CDP...');
     await connectCDP(broadcastFrame);
-    startScreenshots(SCREENSHOT_FPS);
+    await startScreenshots(SCREENSHOT_FPS);
     console.log('[relay] CDP reconnected');
     await flushQueuedActions();
     reconnectDelayMs = RECONNECT_BASE_MS;
@@ -258,8 +258,8 @@ server.listen(PORT, async () => {
   try {
     await connectCDP(broadcastFrame);
     reconnectDelayMs = RECONNECT_BASE_MS;
-    startScreenshots(SCREENSHOT_FPS);
-    console.log('[relay] CDP ready — input + screenshots active\n');
+    await startScreenshots(SCREENSHOT_FPS);
+    console.log('[relay] CDP ready — input + screencast active\n');
   } catch (err) {
     console.error('[relay] CDP connect failed:', (err as Error).message);
     console.error('[relay] Start Chrome with --remote-debugging-port=9222 and restart relay\n');

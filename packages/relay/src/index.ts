@@ -95,6 +95,12 @@ let reconnectDelayMs = RECONNECT_BASE_MS;
 let reconnectInFlight = false;
 const queuedActions: QueuedAction[] = [];
 
+// Single-worker FIFO for live actions. Ensures only one handleAction()
+// runs at a time so CDP mouseMoved/mousePressed/mouseReleased triplets
+// never interleave across concurrent clicks.
+const liveQueue: Record<string, unknown>[] = [];
+let liveWorkerRunning = false;
+
 function pruneQueuedActions(): void {
   const now = Date.now();
   while (queuedActions.length && queuedActions[0]!.expiresAt <= now) queuedActions.shift();
@@ -120,13 +126,32 @@ async function runAction(action: Record<string, unknown>): Promise<void> {
   }
 }
 
+async function drainLiveQueue(): Promise<void> {
+  if (liveWorkerRunning) return;
+  liveWorkerRunning = true;
+  try {
+    while (liveQueue.length) {
+      const action = liveQueue.shift()!;
+      if (!isCDPConnected()) {
+        queueAction(action);
+        scheduleReconnect();
+        continue;
+      }
+      await runAction(action);
+    }
+  } finally {
+    liveWorkerRunning = false;
+  }
+}
+
 function enqueueOrRunAction(action: Record<string, unknown>): void {
   if (!isCDPConnected()) {
     queueAction(action);
     scheduleReconnect();
     return;
   }
-  runAction(action).catch((err) => {
+  liveQueue.push(action);
+  drainLiveQueue().catch((err) => {
     console.error('[relay] action pipeline error:', (err as Error).message ?? err);
   });
 }
@@ -136,8 +161,9 @@ async function flushQueuedActions(): Promise<void> {
   while (queuedActions.length && isCDPConnected()) {
     const next = queuedActions.shift();
     if (!next || next.expiresAt <= Date.now()) continue;
-    await runAction(next.action);
+    liveQueue.push(next.action);
   }
+  await drainLiveQueue();
 }
 
 async function reconnectCDP(): Promise<void> {
@@ -150,7 +176,6 @@ async function reconnectCDP(): Promise<void> {
     startScreenshots(SCREENSHOT_FPS);
     console.log('[relay] CDP reconnected');
     await flushQueuedActions();
-    // Reset backoff only after flush succeeds — so a bad-flush loop stays throttled
     reconnectDelayMs = RECONNECT_BASE_MS;
   } catch (err) {
     console.error('[relay] reconnect failed:', (err as Error).message);
@@ -173,7 +198,6 @@ function scheduleReconnect(): void {
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
-// stopScreenshots is handled inside reconnectCDP; no need to call it here too
 setCDPReconnectHandler(() => {
   scheduleReconnect();
 });

@@ -5,6 +5,8 @@
 import { WebSocket } from 'ws';
 
 export class CDPSession {
+  readonly cdpPort: number;
+
   private cdpWs: WebSocket | null = null;
   private msgId = 1;
   private vpW = 1280;
@@ -15,7 +17,9 @@ export class CDPSession {
   private didSignalDisconnect = false;
   private screenshotInterval: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private cdpPort = 9222) {}
+  constructor(cdpPort = 9222) {
+    this.cdpPort = cdpPort;
+  }
 
   setReconnectHandler(handler: () => void): void {
     this.reconnectHandler = handler;

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { CDPSession } from './cdp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const publicDir = path.join(__dirname, 'public');
 
 const SCREENSHOT_FPS    = 5;
 const RECONNECT_BASE_MS = 1000;
@@ -147,7 +148,6 @@ export class RelaySession {
     const app    = express();
     const server = createServer(app);
     const wss    = new WebSocketServer({ server });
-    const publicDir = path.join(__dirname, 'public');
 
     app.use((_req, res: ServerResponse & { setHeader: (k: string, v: string) => void }, next) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -176,7 +176,12 @@ export class RelaySession {
       }
     });
 
-    app.get('/health', (_req, res) => res.json({ ok: true, port: this.port, cdp: this.cdp.isConnected() }));
+    app.get('/health', (_req, res) => res.json({
+      ok: true,
+      port: this.port,
+      cdpPort: this.cdpPort,
+      cdp: this.cdp.isConnected(),
+    }));
 
     wss.on('connection', (ws, req) => {
       const url = req.url ?? '';

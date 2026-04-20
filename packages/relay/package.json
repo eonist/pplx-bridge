@@ -2,7 +2,7 @@
   "name": "@pplx-bridge/relay",
   "version": "0.1.0",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && node copy-viewer.mjs",
     "dev": "tsc -p tsconfig.json --watch"

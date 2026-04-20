@@ -44,9 +44,12 @@ export class CDPSession {
   private lastClickAt = 0;
   private reconnectHandler: (() => void) | null = null;
   private didSignalDisconnect = false;
-  private screenshotInterval: ReturnType<typeof setInterval> | null = null;
+  private screencastActive = false;
   /** When set, reconnect will re-attach to this specific target ID. */
   private pinnedTargetId: string | undefined;
+
+  // Generic CDP event listeners: method → Set of handlers
+  private eventListeners = new Map<string, Set<(params: Record<string, unknown>) => void>>();
 
   constructor(cdpPort = 9222) {
     this.cdpPort = cdpPort;
@@ -59,11 +62,23 @@ export class CDPSession {
   private signalDisconnect(): void {
     if (this.didSignalDisconnect) return;
     this.didSignalDisconnect = true;
+    this.screencastActive = false;
     this.cdpWs = null;
     this.reconnectHandler?.();
   }
 
   private attachLifecycle(ws: WebSocket): void {
+    ws.on('message', (data: Buffer) => {
+      let msg: Record<string, unknown>;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      // Route CDP events to registered listeners
+      if (typeof msg.method === 'string' && msg.params) {
+        const listeners = this.eventListeners.get(msg.method as string);
+        if (listeners) {
+          for (const fn of listeners) fn(msg.params as Record<string, unknown>);
+        }
+      }
+    });
     ws.on('close', () => {
       console.log(`[cdp:${this.cdpPort}/${this._targetId || '?'}] socket closed`);
       this.signalDisconnect();
@@ -72,6 +87,15 @@ export class CDPSession {
       console.error(`[cdp:${this.cdpPort}/${this._targetId || '?'}] socket error:`, (err as Error).message);
       this.signalDisconnect();
     });
+  }
+
+  private cdpOn(method: string, handler: (params: Record<string, unknown>) => void): void {
+    if (!this.eventListeners.has(method)) this.eventListeners.set(method, new Set());
+    this.eventListeners.get(method)!.add(handler);
+  }
+
+  private cdpOff(method: string, handler: (params: Record<string, unknown>) => void): void {
+    this.eventListeners.get(method)?.delete(handler);
   }
 
   /**
@@ -232,23 +256,56 @@ export class CDPSession {
     }
   }
 
-  startScreenshots(fps = 1): void {
-    if (this.screenshotInterval) return;
-    let busy = false;
-    this.screenshotInterval = setInterval(async () => {
-      if (busy || !this.isConnected()) return;
-      busy = true;
-      try {
-        const result = await this.send('Page.captureScreenshot', { format: 'jpeg', quality: 60, fromSurface: true }) as { data: string };
-        if (this.screenshotCallback) this.screenshotCallback(Buffer.from(result.data, 'base64'));
-      } catch { /* ignore */ } finally { busy = false; }
-    }, Math.round(1000 / fps));
+  // Screencast frame handler — kept as instance property so we can remove it on stop
+  private screencastFrameHandler: ((params: Record<string, unknown>) => void) | null = null;
+
+  /**
+   * Start streaming frames via Page.startScreencast.
+   * Replaces the old captureScreenshot polling — works correctly for
+   * background tabs because Chrome delivers screencast frames per-target
+   * regardless of which tab is focused.
+   *
+   * @param fps  Target frame rate (Chrome honours this only approximately).
+   */
+  startScreenshots(fps = 5): void {
+    if (this.screencastActive) return;
+    this.screencastActive = true;
+
+    this.screencastFrameHandler = (params) => {
+      const { data, sessionId } = params as { data: string; sessionId: number };
+      if (this.screenshotCallback) {
+        this.screenshotCallback(Buffer.from(data, 'base64'));
+      }
+      // Ack the frame so Chrome sends the next one
+      this.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+    };
+
+    this.cdpOn('Page.screencastFrame', this.screencastFrameHandler);
+
+    this.send('Page.startScreencast', {
+      format:        'jpeg',
+      quality:       60,
+      maxWidth:      this.vpW,
+      maxHeight:     this.vpH,
+      everyNthFrame: Math.max(1, Math.round(30 / fps)), // Chrome captures at ~30fps internally
+    }).catch((err) => {
+      console.error(`[cdp:${this.cdpPort}/${this._targetId}] startScreencast error:`, (err as Error).message);
+      this.screencastActive = false;
+    });
+
+    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screencast started (target ~${fps}fps)`);
   }
 
   stopScreenshots(): void {
-    if (this.screenshotInterval) {
-      clearInterval(this.screenshotInterval);
-      this.screenshotInterval = null;
+    if (!this.screencastActive) return;
+    this.screencastActive = false;
+
+    if (this.screencastFrameHandler) {
+      this.cdpOff('Page.screencastFrame', this.screencastFrameHandler);
+      this.screencastFrameHandler = null;
     }
+
+    this.send('Page.stopScreencast', {}).catch(() => {});
+    console.log(`[cdp:${this.cdpPort}/${this._targetId}] screencast stopped`);
   }
 }

@@ -102,6 +102,17 @@ function keyCode(key: string): number {
   return map[key] ?? 0;
 }
 
+// Dispatch a single printable character through the full browser key pipeline.
+// Using keyDown+char+keyUp ensures Lexical's internal event handlers fire and
+// keep their selection model in sync — execCommand('insertText') bypasses
+// Lexical's listeners and causes caret desync on reconciliation.
+async function dispatchChar(char: string): Promise<void> {
+  const params = { key: char, text: char, unmodifiedText: char, windowsVirtualKeyCode: char.charCodeAt(0), nativeVirtualKeyCode: char.charCodeAt(0) };
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', ...params });
+  await send('Input.dispatchKeyEvent', { type: 'char',    ...params });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp',   ...params });
+}
+
 export async function handleAction(action: Record<string, unknown>): Promise<void> {
   const type = action.type as string;
 
@@ -128,20 +139,9 @@ export async function handleAction(action: Record<string, unknown>): Promise<voi
     if (sinceClick < 150) await new Promise(r => setTimeout(r, 150 - sinceClick));
     const text = action.value as string;
     console.log('[cdp] type:', JSON.stringify(text.slice(0, 80)));
-    // Do NOT call el.focus() here — on Lexical editors, programmatic .focus()
-    // from Runtime.evaluate fires Lexical's onFocus handler which resets the
-    // selection state and clobbers the caret position set by the prior click.
-    // On native inputs (e.g. google.com) this was harmless, but on Lexical it
-    // is the root cause of the caret-steal bug. Trust document.activeElement.
-    const result = await send('Runtime.evaluate', {
-      expression: `(function() {
-  var ok = document.execCommand('insertText', false, ${JSON.stringify(text)});
-  return ok;
-})()`,
-      returnByValue: true,
-      awaitPromise: false,
-    }) as { result: { value: unknown } };
-    console.log('[cdp] execCommand result:', result?.result?.value);
+    for (const char of text) {
+      await dispatchChar(char);
+    }
     return;
   }
 
